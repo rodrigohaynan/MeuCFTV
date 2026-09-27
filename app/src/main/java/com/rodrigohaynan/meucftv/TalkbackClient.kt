@@ -108,6 +108,16 @@ class TalkbackClient(
     private fun runYooseeTalkback(
         onStatus: (String) -> Unit
     ) {
+        onStatus("Reiniciando canal de áudio da câmera...")
+
+        resetYooseeAudioSession()
+
+        if (!running.get()) {
+            return
+        }
+
+        Thread.sleep(120L)
+
         onStatus("Abrindo áudio da câmera...")
 
         val localSocket = Socket().apply {
@@ -145,11 +155,13 @@ class TalkbackClient(
         )
         output.flush()
 
-        val response = readInitialResponse(input)
+        val response = readUntilOpenAccepted(input)
 
         if (
-            !response.contains("CSeq: 8", ignoreCase = true) &&
-            !response.contains("200 OK", ignoreCase = true)
+            !response.contains(
+                "CSeq: 8",
+                ignoreCase = true
+            )
         ) {
             throw IOException(
                 "a câmera não confirmou AudioCtlCmd:OPEN"
@@ -235,28 +247,99 @@ class TalkbackClient(
         }
     }
 
-    private fun readInitialResponse(
+    private fun resetYooseeAudioSession() {
+        val resetSocket = Socket()
+
+        try {
+            resetSocket.connect(
+                InetSocketAddress(
+                    config.host,
+                    config.rtspPort
+                ),
+                CONNECT_TIMEOUT_MS
+            )
+
+            resetSocket.soTimeout = 500
+
+            val command = buildString {
+                append("USER_CMD_SET rtsp://")
+                append(config.host)
+                append("/onvif1 RTSP/1.0\r\n")
+                append("CSeq: 10\r\n")
+                append("Content-length: strlen(Content-type)\r\n")
+                append("Content-type: AudioCtlCmd:CLOSE\r\n\r\n")
+            }
+
+            resetSocket
+                .getOutputStream()
+                .write(
+                    command.toByteArray(
+                        Charsets.UTF_8
+                    )
+                )
+
+            resetSocket
+                .getOutputStream()
+                .flush()
+
+            Thread.sleep(60L)
+        } catch (_: Exception) {
+            // A stale session may already be gone. Continue with OPEN.
+        } finally {
+            runCatching {
+                resetSocket.close()
+            }
+        }
+    }
+
+    private fun readUntilOpenAccepted(
         input: BufferedInputStream
     ): String {
+        val all = StringBuilder()
         val buffer = ByteArray(4096)
+        val deadline =
+            System.nanoTime() +
+                RESPONSE_TIMEOUT_MS *
+                1_000_000L
 
-        return try {
-            val read = input.read(buffer)
-            if (read > 0) {
-                String(
+        while (
+            running.get() &&
+            System.nanoTime() <
+                deadline
+        ) {
+            try {
+                val read =
+                    input.read(buffer)
+
+                if (read <= 0) {
+                    break
+                }
+
+                val part = String(
                     buffer,
                     0,
                     read,
                     Charsets.UTF_8
                 )
-            } else {
-                ""
+
+                all.append(part)
+
+                if (
+                    all.contains(
+                        "CSeq: 8",
+                        ignoreCase = true
+                    )
+                ) {
+                    return all.toString()
+                }
+            } catch (
+                _: SocketTimeoutException
+            ) {
+                break
             }
-        } catch (error: SocketTimeoutException) {
-            throw IOException(
-                "a câmera não respondeu ao comando de áudio"
-            )
         }
+
+        return all.toString()
     }
 
     private fun readPcmChunk(
@@ -318,8 +401,9 @@ class TalkbackClient(
         private const val CHUNK_SIZE = 320
         private const val PROPRIETARY_PADDING_SIZE = 12
 
-        // 10 x 20 ms = 200 ms initial cushion.
-        private const val PREBUFFER_PACKETS = 10
+        // 50 x 20 ms = about one second, matching the Yoosee
+        // reference intercom implementation before the initial burst.
+        private const val PREBUFFER_PACKETS = 50
 
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val RESPONSE_TIMEOUT_MS = 3_000
