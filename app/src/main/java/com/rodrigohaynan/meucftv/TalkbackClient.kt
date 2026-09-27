@@ -171,7 +171,7 @@ class TalkbackClient(
         }
 
         val recorder = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
@@ -202,6 +202,9 @@ class TalkbackClient(
             PREBUFFER_PACKETS
         )
 
+        // Yoosee firmware benefits from roughly one second of initial audio
+        // already queued in the camera. This mirrors the known-good desktop
+        // intercom implementation instead of sending a tiny burst.
         while (
             running.get() &&
             prebuffer.size < PREBUFFER_PACKETS
@@ -211,16 +214,31 @@ class TalkbackClient(
                 chunk
             ) ?: continue
 
+            applyPcmGain(
+                complete,
+                TALKBACK_GAIN
+            )
+
             prebuffer += complete
         }
 
+        var totalBytesSent = 0L
+
         for (buffered in prebuffer) {
             if (!running.get()) break
+
             sendYooseeAudioFrame(
                 output,
                 buffered
             )
+
+            totalBytesSent +=
+                buffered.size
         }
+
+        val pacingStartMs =
+            System.nanoTime() /
+                1_000_000L
 
         while (running.get()) {
             val complete = readPcmChunk(
@@ -228,10 +246,50 @@ class TalkbackClient(
                 chunk
             ) ?: continue
 
+            applyPcmGain(
+                complete,
+                TALKBACK_GAIN
+            )
+
+            while (running.get()) {
+                val elapsedMs =
+                    (
+                        System.nanoTime() /
+                            1_000_000L
+                        ) - pacingStartMs
+
+                val audioSentMs =
+                    (
+                        totalBytesSent *
+                            1_000L
+                        ) /
+                        (
+                            SAMPLE_RATE *
+                                2L
+                            )
+
+                if (
+                    audioSentMs <=
+                    elapsedMs +
+                        MAX_BUFFER_AHEAD_MS
+                ) {
+                    break
+                }
+
+                Thread.sleep(5L)
+            }
+
+            if (!running.get()) {
+                break
+            }
+
             sendYooseeAudioFrame(
                 output,
                 complete
             )
+
+            totalBytesSent +=
+                complete.size
         }
     }
 
@@ -291,6 +349,49 @@ class TalkbackClient(
         return reusable.copyOf()
     }
 
+    private fun applyPcmGain(
+        pcm: ByteArray,
+        gain: Float
+    ) {
+        var index = 0
+
+        while (index + 1 < pcm.size) {
+            val sample =
+                (
+                    (pcm[index + 1].toInt() shl 8) or
+                        (pcm[index].toInt() and 0xff)
+                    ).toShort()
+
+            val scaled =
+                (
+                    sample.toInt() *
+                        gain
+                    )
+                    .toInt()
+                    .coerceIn(
+                        Short.MIN_VALUE.toInt(),
+                        Short.MAX_VALUE.toInt()
+                    )
+                    .toShort()
+
+            pcm[index] =
+                (
+                    scaled.toInt() and
+                        0xff
+                    ).toByte()
+
+            pcm[index + 1] =
+                (
+                    (
+                        scaled.toInt()
+                            shr 8
+                        ) and 0xff
+                    ).toByte()
+
+            index += 2
+        }
+    }
+
     private fun sendYooseeAudioFrame(
         output: BufferedOutputStream,
         pcm: ByteArray
@@ -318,8 +419,14 @@ class TalkbackClient(
         private const val CHUNK_SIZE = 320
         private const val PROPRIETARY_PADDING_SIZE = 12
 
-        // 10 x 20 ms = 200 ms initial cushion.
-        private const val PREBUFFER_PACKETS = 10
+        // 50 x 20 ms = roughly one second, matching the known-good
+        // Yoosee intercom buffering behavior.
+        private const val PREBUFFER_PACKETS = 50
+
+        private const val MAX_BUFFER_AHEAD_MS = 2_000L
+
+        // Reduce clipping/AGC artifacts from phone microphones.
+        private const val TALKBACK_GAIN = 0.45f
 
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val RESPONSE_TIMEOUT_MS = 3_000
