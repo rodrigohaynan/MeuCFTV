@@ -88,6 +88,7 @@ class CameraStreamController {
     private var audioChannels = 1
     private var audioSamplesQueued = 0L
     private var audioFramesWritten = 0L
+    private var audioStartOffsetUs = Long.MIN_VALUE
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -276,17 +277,14 @@ class CameraStreamController {
                     muxer = localMuxer
                     muxerReady = true
 
-                    if (
-                        recentGop
-                            .firstOrNull()
-                            ?.sync == true
-                    ) {
+                    if (recentGop.isNotEmpty()) {
                         val buffered =
                             recentGop.toList()
 
-                        for (unit in buffered) {
+                        buffered.forEachIndexed { index, unit ->
                             writeVideoAccessUnitLocked(
-                                unit
+                                unit,
+                                forceSync = index == 0
                             )
                         }
                     }
@@ -554,6 +552,16 @@ class CameraStreamController {
                 return
             }
 
+            if (audioStartOffsetUs == Long.MIN_VALUE) {
+                val nowUs = System.nanoTime() / 1_000L
+                audioStartOffsetUs =
+                    if (videoStartArrivalUs != Long.MIN_VALUE) {
+                        max(0L, nowUs - videoStartArrivalUs)
+                    } else {
+                        0L
+                    }
+            }
+
             when (audioMode) {
                 RecordingAudioMode
                     .AAC_DIRECT -> {
@@ -618,33 +626,28 @@ class CameraStreamController {
             recentGopBytes = 0
         }
 
-        if (
-            unit.sync ||
-            recentGop.isNotEmpty()
-        ) {
-            recentGop.addLast(
-                unit
-            )
-            recentGopBytes +=
-                unit.data.size
-            trimRecentGopLocked()
-        }
+        recentGop.addLast(unit)
+        recentGopBytes += unit.data.size
+        trimRecentGopLocked()
 
         if (
             recordingRequested &&
             muxerReady
         ) {
             if (videoSamplesWritten == 0L) {
-                if (unit.sync) {
-                    writeVideoAccessUnitLocked(
-                        unit
+                writeVideoAccessUnitLocked(
+                    unit,
+                    forceSync = true
+                )
+
+                onMain {
+                    statusCallback?.invoke(
+                        if (unit.sync) {
+                            "● REC gravando • quadro de sincronização encontrado"
+                        } else {
+                            "● REC gravando • modo compatibilidade Yoosee"
+                        }
                     )
-                    onMain {
-                        statusCallback?.invoke(
-                            "● REC gravando • " +
-                                "quadro de sincronização encontrado"
-                        )
-                    }
                 }
             } else {
                 writeVideoAccessUnitLocked(
@@ -686,32 +689,52 @@ class CameraStreamController {
     }
 
     private fun trimRecentGopLocked() {
-        while (
-            recentGopBytes >
-            MAX_GOP_BUFFER_BYTES &&
-            recentGop.size > 1
-        ) {
+        val newestArrivalUs =
+            recentGop.lastOrNull()?.arrivalUs
+                ?: return
+
+        while (recentGop.size > 1) {
+            val oldest =
+                recentGop.first()
+
+            val tooLarge =
+                recentGopBytes >
+                    MAX_GOP_BUFFER_BYTES
+
+            val tooOld =
+                newestArrivalUs -
+                    oldest.arrivalUs >
+                    PRE_ROLL_US
+
+            if (!tooLarge && !tooOld) {
+                break
+            }
+
             val removed =
                 recentGop.removeFirst()
 
             recentGopBytes -=
                 removed.data.size
-
-            if (removed.sync) {
-                recentGop.clear()
-                recentGopBytes = 0
-                break
-            }
         }
     }
 
     private fun writeVideoAccessUnitLocked(
-        unit: AccessUnit
+        unit: AccessUnit,
+        forceSync: Boolean = false
     ) {
         val localMuxer =
             muxer ?: return
 
         if (videoTrackIndex < 0) {
+            return
+        }
+
+        val mp4Sample =
+            annexBToAvccSample(
+                unit.data
+            )
+
+        if (mp4Sample.isEmpty()) {
             return
         }
 
@@ -737,14 +760,17 @@ class CameraStreamController {
 
         lastVideoPtsUs = ptsUs
 
+        val isSync =
+            unit.sync || forceSync
+
         val info =
             MediaCodec.BufferInfo()
                 .apply {
                     set(
                         0,
-                        unit.data.size,
+                        mp4Sample.size,
                         ptsUs,
-                        if (unit.sync) {
+                        if (isSync) {
                             MediaCodec
                                 .BUFFER_FLAG_KEY_FRAME
                         } else {
@@ -757,7 +783,7 @@ class CameraStreamController {
             localMuxer.writeSampleData(
                 videoTrackIndex,
                 ByteBuffer.wrap(
-                    unit.data
+                    mp4Sample
                 ),
                 info
             )
@@ -772,6 +798,54 @@ class CameraStreamController {
                         )
             )
         }
+    }
+
+    private fun annexBToAvccSample(
+        data: ByteArray
+    ): ByteArray {
+        val nals =
+            splitAnnexBNals(
+                data
+            )
+
+        if (nals.isEmpty()) {
+            return ByteArray(0)
+        }
+
+        val out =
+            ByteArrayOutputStream(
+                data.size
+            )
+
+        for (nal in nals) {
+            if (nal.isEmpty()) continue
+
+            val type =
+                nal[0].toInt() and 0x1f
+
+            // SPS/PPS belong in csd-0/csd-1 (avcC), not normal MP4 samples.
+            if (type == 7 || type == 8) {
+                continue
+            }
+
+            val size = nal.size
+
+            out.write(
+                (size ushr 24) and 0xff
+            )
+            out.write(
+                (size ushr 16) and 0xff
+            )
+            out.write(
+                (size ushr 8) and 0xff
+            )
+            out.write(
+                size and 0xff
+            )
+            out.write(nal)
+        }
+
+        return out.toByteArray()
     }
 
     private fun configureAudioTrackLocked(
@@ -934,11 +1008,12 @@ class CameraStreamController {
         }
 
         val ptsUs =
-            (
-                audioSamplesQueued *
-                    1_000_000L
-                ) /
-                audioSampleRate
+            (if (audioStartOffsetUs == Long.MIN_VALUE) 0L else audioStartOffsetUs) +
+                (
+                    audioSamplesQueued *
+                        1_000_000L
+                    ) /
+                    audioSampleRate
 
         val info =
             MediaCodec.BufferInfo()
@@ -1062,11 +1137,12 @@ class CameraStreamController {
                     audioChannels
 
             val ptsUs =
-                (
-                    audioSamplesQueued *
-                        1_000_000L
+                (if (audioStartOffsetUs == Long.MIN_VALUE) 0L else audioStartOffsetUs) +
+                    (
+                        audioSamplesQueued *
+                            1_000_000L
                     ) /
-                    audioSampleRate
+                        audioSampleRate
 
             encoder.queueInputBuffer(
                 inputIndex,
@@ -1637,7 +1713,7 @@ class CameraStreamController {
         ) {
             "● REC gravando • $audioText"
         } else {
-            "REC ativo • aguardando quadro I/IDR • $audioText"
+            "REC ativo • modo compatibilidade Yoosee • $audioText"
         }
     }
 
@@ -1789,6 +1865,7 @@ class CameraStreamController {
             RecordingAudioMode.NONE
         audioSamplesQueued = 0L
         audioFramesWritten = 0L
+        audioStartOffsetUs = Long.MIN_VALUE
     }
 
     private data class OutputTarget(
@@ -2088,6 +2165,9 @@ class CameraStreamController {
     companion object {
         private const val MAX_GOP_BUFFER_BYTES =
             24 * 1024 * 1024
+
+        private const val PRE_ROLL_US =
+            3_000_000L
 
         private const val AAC_SAMPLES_PER_FRAME =
             1024L
