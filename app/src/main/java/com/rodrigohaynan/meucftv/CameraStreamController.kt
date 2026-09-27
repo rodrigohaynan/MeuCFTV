@@ -729,10 +729,10 @@ class CameraStreamController {
             return
         }
 
-        val mp4Sample =
-            annexBToAvccSample(
-                unit.data
-            )
+        // Android MediaMuxer expects H.264 access units in Annex-B form.
+        // RtspSurfaceView already delivers each NAL with 00 00 00 01 start
+        // codes, so pass the access unit through unchanged.
+        val mp4Sample = unit.data
 
         if (mp4Sample.isEmpty()) {
             return
@@ -798,54 +798,6 @@ class CameraStreamController {
                         )
             )
         }
-    }
-
-    private fun annexBToAvccSample(
-        data: ByteArray
-    ): ByteArray {
-        val nals =
-            splitAnnexBNals(
-                data
-            )
-
-        if (nals.isEmpty()) {
-            return ByteArray(0)
-        }
-
-        val out =
-            ByteArrayOutputStream(
-                data.size
-            )
-
-        for (nal in nals) {
-            if (nal.isEmpty()) continue
-
-            val type =
-                nal[0].toInt() and 0x1f
-
-            // SPS/PPS belong in csd-0/csd-1 (avcC), not normal MP4 samples.
-            if (type == 7 || type == 8) {
-                continue
-            }
-
-            val size = nal.size
-
-            out.write(
-                (size ushr 24) and 0xff
-            )
-            out.write(
-                (size ushr 16) and 0xff
-            )
-            out.write(
-                (size ushr 8) and 0xff
-            )
-            out.write(
-                size and 0xff
-            )
-            out.write(nal)
-        }
-
-        return out.toByteArray()
     }
 
     private fun configureAudioTrackLocked(
@@ -2167,7 +2119,7 @@ class CameraStreamController {
             24 * 1024 * 1024
 
         private const val PRE_ROLL_US =
-            3_000_000L
+            8_000_000L
 
         private const val AAC_SAMPLES_PER_FRAME =
             1024L
