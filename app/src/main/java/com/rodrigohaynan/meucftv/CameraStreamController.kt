@@ -249,7 +249,8 @@ class CameraStreamController {
                 "Vídeo salvo: Armazenamento interno > Movies > MeuCFTV > " +
                     (recordingDisplayName ?: "MeuCFTV.mp4")
             } else {
-                "Nenhum quadro H.264 foi gravado; arquivo incompleto removido"
+                "Nenhum quadro H.264 foi gravado; frames vistos: $videoFramesSeen, " +
+                    "quadros-chave: $keyFramesSeen; arquivo incompleto removido"
             }
 
             resetRecordingState()
