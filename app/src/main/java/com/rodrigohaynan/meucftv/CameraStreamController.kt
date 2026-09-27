@@ -46,6 +46,7 @@ class CameraStreamController {
     private var parcelFileDescriptor: ParcelFileDescriptor? = null
     private var recordingUri: Uri? = null
     private var fallbackRecordingFile: File? = null
+    private var recordingDisplayName: String? = null
     private var firstTimestampMs = Long.MIN_VALUE
     private var lastPtsUs = -1L
     private var writtenSamples = 0
@@ -130,7 +131,7 @@ class CameraStreamController {
                 }
 
                 message = if (sampleCount > 0) {
-                    "Vídeo salvo em Filmes/MeuCFTV"
+                    "Vídeo salvo no armazenamento interno: Movies/MeuCFTV/${recordingDisplayName ?: "MeuCFTV.mp4"}"
                 } else {
                     "Nenhum quadro foi gravado"
                 }
@@ -255,6 +256,7 @@ class CameraStreamController {
     private fun createMuxer(context: Context): Boolean {
         return runCatching {
             val output = createVideoOutput(context)
+            recordingDisplayName = output.displayName
             recordingUri = output.uri
             fallbackRecordingFile = output.file
             parcelFileDescriptor = output.pfd
@@ -312,12 +314,14 @@ class CameraStreamController {
         lastPtsUs = -1L
         writtenSamples = 0
         recordingContext = null
+        recordingDisplayName = null
     }
 
     private data class OutputTarget(
         val uri: Uri?,
         val file: File?,
-        val pfd: ParcelFileDescriptor
+        val pfd: ParcelFileDescriptor,
+        val displayName: String
     )
 
     private fun createVideoOutput(context: Context): OutputTarget {
@@ -342,7 +346,7 @@ class CameraStreamController {
             val pfd = context.contentResolver.openFileDescriptor(uri, "rw")
                 ?: error("Não foi possível abrir o arquivo de vídeo")
 
-            return OutputTarget(uri, null, pfd)
+            return OutputTarget(uri, null, pfd, fileName)
         }
 
         val directory = File(
@@ -358,7 +362,7 @@ class CameraStreamController {
                 ParcelFileDescriptor.MODE_TRUNCATE
         )
 
-        return OutputTarget(Uri.fromFile(file), file, pfd)
+        return OutputTarget(Uri.fromFile(file), file, pfd, fileName)
     }
 
     private fun saveSnapshot(context: Context, bitmap: Bitmap): Uri? {
