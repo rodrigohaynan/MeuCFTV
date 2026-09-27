@@ -28,6 +28,7 @@ class OnvifClient(
             postSoap(
                 url = current.ptzUrl,
                 action = ACTION_CONTINUOUS_MOVE,
+                tolerateClosedResponse = true,
                 body = """
                     <tptz:ContinuousMove>
                         <tptz:ProfileToken>${xmlEscape(current.profileToken)}</tptz:ProfileToken>
@@ -50,6 +51,7 @@ class OnvifClient(
             postSoap(
                 url = current.ptzUrl,
                 action = ACTION_STOP,
+                tolerateClosedResponse = true,
                 body = """
                     <tptz:Stop>
                         <tptz:ProfileToken>${xmlEscape(current.profileToken)}</tptz:ProfileToken>
@@ -116,42 +118,67 @@ class OnvifClient(
     private fun postSoap(
         url: String,
         action: String,
-        body: String
+        body: String,
+        tolerateClosedResponse: Boolean = false
     ): String {
         val envelope = soapEnvelope(body)
+        val payload = envelope.toByteArray(Charsets.UTF_8)
+
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 5_000
             readTimeout = 7_000
             doOutput = true
             useCaches = false
+            setRequestProperty("Connection", "close")
+            setRequestProperty("Accept", "application/soap+xml, text/xml, */*")
+            setRequestProperty("User-Agent", "MeuCFTV/0.1.2")
             setRequestProperty(
                 "Content-Type",
                 "application/soap+xml; charset=utf-8; action=\"$action\""
             )
+            setFixedLengthStreamingMode(payload.size)
         }
 
-        connection.outputStream.use {
-            it.write(envelope.toByteArray(Charsets.UTF_8))
+        try {
+            connection.outputStream.use {
+                it.write(payload)
+                it.flush()
+            }
+
+            val responseCode = try {
+                connection.responseCode
+            } catch (error: IOException) {
+                if (tolerateClosedResponse) return ""
+                throw error
+            }
+
+            val stream = if (responseCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            }
+
+            val response = try {
+                stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            } catch (error: IOException) {
+                if (tolerateClosedResponse && responseCode in 200..299) {
+                    ""
+                } else {
+                    throw error
+                }
+            }
+
+            if (responseCode !in 200..299) {
+                throw IOException(
+                    "ONVIF HTTP $responseCode${if (response.isBlank()) "" else ": $response"}"
+                )
+            }
+
+            return response
+        } finally {
+            connection.disconnect()
         }
-
-        val responseCode = connection.responseCode
-        val stream = if (responseCode in 200..299) {
-            connection.inputStream
-        } else {
-            connection.errorStream
-        }
-
-        val response = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
-        connection.disconnect()
-
-        if (responseCode !in 200..299) {
-            throw IOException(
-                "ONVIF HTTP $responseCode${if (response.isBlank()) "" else ": $response"}"
-            )
-        }
-
-        return response
     }
 
     private fun soapEnvelope(body: String): String = """
