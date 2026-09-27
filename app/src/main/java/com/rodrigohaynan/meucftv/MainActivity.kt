@@ -70,7 +70,6 @@ private fun MeuCftvApp() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val store = remember { SecureCameraStore(context) }
     val streamController = remember { CameraStreamController() }
-    val recorder = remember { RtspRecorder() }
     val audioManager = remember {
         context.getSystemService(AudioManager::class.java)
     }
@@ -157,8 +156,8 @@ private fun MeuCftvApp() {
     DisposableEffect(Unit) {
         onDispose {
             talkback.stop()
-            if (recorder.isRecording()) {
-                recorder.stop { }
+            if (streamController.isRecording()) {
+                streamController.stopRecording { }
             }
         }
     }
@@ -190,8 +189,8 @@ private fun MeuCftvApp() {
                 CameraSettings(
                     current = config,
                     onSave = { newConfig ->
-                        if (recorder.isRecording()) {
-                            recorder.stop { message ->
+                        if (streamController.isRecording()) {
+                            streamController.stopRecording { message ->
                                 mainHandler.post { status = message }
                             }
                         }
@@ -297,26 +296,22 @@ private fun MeuCftvApp() {
                         }
                     },
                     onToggleRecording = {
-                        if (recorder.isRecording()) {
-                            recorder.stop { message ->
-                                mainHandler.post { status = message }
+                        if (streamController.isRecording()) {
+                            streamController.stopRecording { message ->
+                                status = message
                             }
+                            recording = false
                         } else {
                             recording = true
-                            recorder.start(
+                            streamController.startRecording(
                                 context = context,
-                                config = config,
-                                onStatus = { message ->
-                                    mainHandler.post {
-                                        status = message
-                                    }
-                                },
-                                onStopped = {
-                                    mainHandler.post {
-                                        recording = false
-                                    }
+                                config = config
+                            ) { message ->
+                                status = message
+                                if (!streamController.isRecording()) {
+                                    recording = false
                                 }
-                            )
+                            }
                         }
                     }
                 )
@@ -468,7 +463,7 @@ private fun PressToTalkButton(
         } else {
             MaterialTheme.colorScheme.secondaryContainer
         },
-        modifier = Modifier.pointerInput(talking) {
+        modifier = Modifier.pointerInput(Unit) {
             detectTapGestures(
                 onPress = {
                     onPress()
