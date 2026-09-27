@@ -395,11 +395,12 @@ class CameraStreamController {
         runCatching { muxer?.release() }
         runCatching { parcelFileDescriptor?.close() }
 
+        val callback = statusCallback
         finalizeMediaStore(false)
         resetRecordingState()
 
         onMain {
-            statusCallback?.invoke(message)
+            callback?.invoke(message)
         }
     }
 
