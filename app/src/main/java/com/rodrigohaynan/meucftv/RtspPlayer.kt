@@ -94,6 +94,13 @@ fun RtspPlayer(
                     length: Int,
                     timestamp: Long
                 ) {
+                    controller.onAudioSample(
+                        data,
+                        offset,
+                        length,
+                        timestamp
+                    )
+
                     if (length > 0 && !audioReported) {
                         audioReported = true
                         target.post { onAudioDetected() }
@@ -105,7 +112,7 @@ fun RtspPlayer(
                 uri = uri,
                 username = config.rtspUser.ifBlank { null },
                 password = config.password.ifBlank { null },
-                userAgent = "MeuCFTV/0.1.3",
+                userAgent = "MeuCFTV/0.2.0",
                 socketTimeout = 7_000
             )
             target.debug = true
