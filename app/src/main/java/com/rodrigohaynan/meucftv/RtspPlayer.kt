@@ -17,7 +17,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.alexvas.rtsp.RtspClient
 import com.alexvas.rtsp.widget.RtspSurfaceView
 
 @Composable
@@ -50,8 +49,7 @@ fun RtspPlayer(
                 username = config.rtspUser.ifBlank { null },
                 password = config.password.ifBlank { null },
                 userAgent = "MeuCFTV/0.1.2",
-                socketTimeout = 7_000,
-                transport = RtspClient.Transport.TCP
+                socketTimeout = 7_000
             )
             target.debug = true
             target.start(
