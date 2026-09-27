@@ -55,6 +55,18 @@ class CameraStreamController {
     private var waitingForKeyFrame = true
     private var statusCallback: ((String) -> Unit)? = null
 
+    private data class BufferedVideoFrame(
+        val data: ByteArray,
+        val timestampMs: Long,
+        val keyFrame: Boolean
+    )
+
+    private val gopBuffer = ArrayDeque<BufferedVideoFrame>()
+    private var gopBufferBytes = 0
+    private var videoFramesSeen = 0L
+    private var keyFramesSeen = 0L
+    private var lastRecordedTimestampMs = Long.MIN_VALUE
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     fun attach(view: RtspSurfaceView) {
@@ -171,6 +183,17 @@ class CameraStreamController {
                     localMuxer.start()
                     muxer = localMuxer
                     muxerReady = true
+
+                    if (gopBuffer.firstOrNull()?.keyFrame == true) {
+                        firstTimestampMs = gopBuffer.first().timestampMs
+                        for (frame in gopBuffer) {
+                            writeVideoFrameLocked(
+                                frame.data,
+                                frame.timestampMs,
+                                frame.keyFrame
+                            )
+                        }
+                    }
                 }.onFailure { error ->
                     runCatching { localMuxer.release() }
                     failRecordingLocked(
@@ -182,7 +205,13 @@ class CameraStreamController {
 
                 onMain {
                     statusCallback?.invoke(
-                        "REC ativo • aguardando próximo quadro-chave H.264"
+                        if (writtenSamples > 0) {
+                            "● REC gravando • quadro-chave em cache • " +
+                                (recordingDisplayName ?: "MeuCFTV.mp4")
+                        } else {
+                            "REC ativo • aguardando quadro-chave H.264 • " +
+                                "frames vistos: $videoFramesSeen"
+                        }
                     )
                 }
             }
@@ -300,80 +329,208 @@ class CameraStreamController {
         length: Int,
         timestampMs: Long
     ) {
-        if (!recordingRequested || length <= 0) return
+        if (length <= 0) return
+
+        val copied = data.copyOfRange(
+            offset,
+            offset + length
+        )
+
+        val keyFrame = isH264KeyFrame(
+            copied
+        )
 
         synchronized(recordLock) {
-            if (!recordingRequested || !muxerReady) return
+            videoFramesSeen++
 
-            val localMuxer = muxer ?: return
-            val trackIndex = videoTrackIndex
-            if (trackIndex < 0) return
+            if (keyFrame) {
+                keyFramesSeen++
+                gopBuffer.clear()
+                gopBufferBytes = 0
+            }
 
-            val keyFrame = VideoCodecUtils.isAnyKeyFrame(
-                data,
-                offset,
-                minOf(length, 1024),
-                false
-            )
+            if (keyFrame || gopBuffer.isNotEmpty()) {
+                gopBuffer.addLast(
+                    BufferedVideoFrame(
+                        data = copied,
+                        timestampMs = timestampMs,
+                        keyFrame = keyFrame
+                    )
+                )
+                gopBufferBytes += copied.size
+                trimGopBuffer()
+            }
 
-            if (waitingForKeyFrame) {
-                if (!keyFrame) return
+            if (!recordingRequested || !muxerReady) {
+                return
+            }
 
-                waitingForKeyFrame = false
-                firstTimestampMs = timestampMs
+            if (writtenSamples == 0) {
+                if (gopBuffer.isEmpty()) {
+                    onMain {
+                        statusCallback?.invoke(
+                            "REC pronto • aguardando primeiro quadro-chave H.264"
+                        )
+                    }
+                    return
+                }
+
+                val first = gopBuffer.firstOrNull()
+                if (first?.keyFrame != true) {
+                    return
+                }
+
+                firstTimestampMs = first.timestampMs
+
+                for (frame in gopBuffer) {
+                    writeVideoFrameLocked(
+                        frame.data,
+                        frame.timestampMs,
+                        frame.keyFrame
+                    )
+                }
 
                 onMain {
                     statusCallback?.invoke(
-                        "● REC gravando • " +
+                        "● REC gravando • quadro-chave obtido • " +
                             (recordingDisplayName ?: "MeuCFTV.mp4")
                     )
                 }
+
+                return
             }
 
-            val sample = data.copyOfRange(
-                offset,
-                offset + length
+            if (timestampMs <= lastRecordedTimestampMs) {
+                return
+            }
+
+            writeVideoFrameLocked(
+                copied,
+                timestampMs,
+                keyFrame
             )
+        }
+    }
 
-            val calculatedPtsUs =
-                max(0L, (timestampMs - firstTimestampMs) * 1_000L)
+    private fun trimGopBuffer() {
+        while (
+            gopBufferBytes > MAX_GOP_BUFFER_BYTES &&
+            gopBuffer.size > 1
+        ) {
+            val removed = gopBuffer.removeFirst()
+            gopBufferBytes -= removed.data.size
 
-            val ptsUs =
-                if (calculatedPtsUs <= lastPtsUs) {
-                    lastPtsUs + 1L
-                } else {
-                    calculatedPtsUs
-                }
-
-            lastPtsUs = ptsUs
-
-            val info = MediaCodec.BufferInfo().apply {
-                set(
-                    0,
-                    sample.size,
-                    ptsUs,
-                    if (keyFrame) {
-                        MediaCodec.BUFFER_FLAG_KEY_FRAME
-                    } else {
-                        0
-                    }
-                )
-            }
-
-            runCatching {
-                localMuxer.writeSampleData(
-                    trackIndex,
-                    ByteBuffer.wrap(sample),
-                    info
-                )
-                writtenSamples++
-            }.onFailure { error ->
-                failRecordingLocked(
-                    "Erro ao gravar quadro: " +
-                        (error.message ?: error.javaClass.simpleName)
-                )
+            if (removed.keyFrame) {
+                gopBuffer.clear()
+                gopBufferBytes = 0
+                break
             }
         }
+    }
+
+    private fun writeVideoFrameLocked(
+        sample: ByteArray,
+        timestampMs: Long,
+        keyFrame: Boolean
+    ) {
+        val localMuxer = muxer ?: return
+        if (videoTrackIndex < 0) return
+
+        if (firstTimestampMs == Long.MIN_VALUE) {
+            firstTimestampMs = timestampMs
+        }
+
+        val calculatedPtsUs =
+            max(
+                0L,
+                (timestampMs - firstTimestampMs) * 1_000L
+            )
+
+        val ptsUs =
+            if (calculatedPtsUs <= lastPtsUs) {
+                lastPtsUs + 1L
+            } else {
+                calculatedPtsUs
+            }
+
+        lastPtsUs = ptsUs
+        lastRecordedTimestampMs = timestampMs
+
+        val info = MediaCodec.BufferInfo().apply {
+            set(
+                0,
+                sample.size,
+                ptsUs,
+                if (keyFrame) {
+                    MediaCodec.BUFFER_FLAG_KEY_FRAME
+                } else {
+                    0
+                }
+            )
+        }
+
+        runCatching {
+            localMuxer.writeSampleData(
+                videoTrackIndex,
+                ByteBuffer.wrap(sample),
+                info
+            )
+            writtenSamples++
+        }.onFailure { error ->
+            failRecordingLocked(
+                "Erro ao gravar quadro: " +
+                    (error.message ?: error.javaClass.simpleName)
+            )
+        }
+    }
+
+    private fun isH264KeyFrame(
+        data: ByteArray
+    ): Boolean {
+        if (data.isEmpty()) return false
+
+        var i = 0
+        var foundStartCode = false
+
+        while (i < data.size - 3) {
+            val startCodeLength = when {
+                i + 3 < data.size &&
+                    data[i] == 0.toByte() &&
+                    data[i + 1] == 0.toByte() &&
+                    data[i + 2] == 0.toByte() &&
+                    data[i + 3] == 1.toByte() -> 4
+
+                data[i] == 0.toByte() &&
+                    data[i + 1] == 0.toByte() &&
+                    data[i + 2] == 1.toByte() -> 3
+
+                else -> 0
+            }
+
+            if (startCodeLength > 0) {
+                foundStartCode = true
+                val nalIndex = i + startCodeLength
+
+                if (nalIndex < data.size) {
+                    val nalType =
+                        data[nalIndex].toInt() and 0x1f
+
+                    if (nalType == 5) {
+                        return true
+                    }
+                }
+
+                i = nalIndex
+            } else {
+                i++
+            }
+        }
+
+        if (!foundStartCode) {
+            return (data[0].toInt() and 0x1f) == 5
+        }
+
+        return false
     }
 
     private fun failRecording(message: String) {
@@ -454,6 +611,7 @@ class CameraStreamController {
         waitingForKeyFrame = true
         recordingContext = null
         statusCallback = null
+        lastRecordedTimestampMs = Long.MIN_VALUE
     }
 
     private data class OutputTarget(
@@ -629,5 +787,9 @@ class CameraStreamController {
         } else {
             mainHandler.post(block)
         }
+    }
+
+    companion object {
+        private const val MAX_GOP_BUFFER_BYTES = 24 * 1024 * 1024
     }
 }
