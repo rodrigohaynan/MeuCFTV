@@ -1,9 +1,15 @@
 package com.rodrigohaynan.meucftv
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -63,12 +69,14 @@ private fun MeuCftvApp() {
     val audioManager = remember {
         context.getSystemService(AudioManager::class.java)
     }
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
 
     var config by remember { mutableStateOf(store.load()) }
     var showSettings by remember { mutableStateOf(!config.isConfigured) }
     var status by remember { mutableStateOf("Pronto") }
     var audioDetected by remember { mutableStateOf(false) }
     var recording by remember { mutableStateOf(false) }
+    var talking by remember { mutableStateOf(false) }
     var muted by remember {
         mutableStateOf(audioManager.isStreamMute(AudioManager.STREAM_MUSIC))
     }
@@ -77,6 +85,7 @@ private fun MeuCftvApp() {
     }
 
     val scope = rememberCoroutineScope()
+
     val onvif = remember(
         config.host,
         config.onvifPort,
@@ -86,8 +95,48 @@ private fun MeuCftvApp() {
         OnvifClient(config)
     }
 
+    val talkback = remember(
+        config.host,
+        config.rtspPort,
+        config.rtspPath,
+        config.rtspUser,
+        config.password
+    ) {
+        TalkbackClient(config)
+    }
+
+    fun beginTalkback() {
+        if (talkback.isTalking()) return
+
+        talking = true
+        talkback.start(
+            onStatus = { message ->
+                mainHandler.post {
+                    status = message
+                }
+            },
+            onStopped = {
+                mainHandler.post {
+                    talking = false
+                }
+            }
+        )
+    }
+
+    val microphonePermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            beginTalkback()
+        } else {
+            status = "Permissão do microfone negada"
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
+            talkback.stop()
+
             if (streamController.isRecording()) {
                 streamController.stopRecording { }
             }
@@ -126,6 +175,11 @@ private fun MeuCftvApp() {
                                 status = it
                             }
                             recording = false
+                        }
+
+                        if (talking) {
+                            talkback.stop()
+                            talking = false
                         }
 
                         store.save(newConfig)
@@ -169,6 +223,7 @@ private fun MeuCftvApp() {
                     muted = muted,
                     volumePercent = volumePercent,
                     recording = recording,
+                    talking = talking,
                     onVolumeDown = {
                         audioManager.adjustStreamVolume(
                             AudioManager.STREAM_MUSIC,
@@ -179,11 +234,12 @@ private fun MeuCftvApp() {
                         volumePercent = getVolumePercent(audioManager)
                     },
                     onToggleMute = {
-                        val direction = if (audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) {
-                            AudioManager.ADJUST_UNMUTE
-                        } else {
-                            AudioManager.ADJUST_MUTE
-                        }
+                        val direction =
+                            if (audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                                AudioManager.ADJUST_UNMUTE
+                            } else {
+                                AudioManager.ADJUST_MUTE
+                            }
 
                         audioManager.adjustStreamVolume(
                             AudioManager.STREAM_MUSIC,
@@ -202,6 +258,23 @@ private fun MeuCftvApp() {
                         )
                         muted = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
                         volumePercent = getVolumePercent(audioManager)
+                    },
+                    onToggleTalkback = {
+                        if (talking || talkback.isTalking()) {
+                            talkback.stop()
+                            talking = false
+                            status = "Microfone desligado"
+                        } else if (
+                            context.checkSelfPermission(
+                                Manifest.permission.RECORD_AUDIO
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            beginTalkback()
+                        } else {
+                            microphonePermissionLauncher.launch(
+                                Manifest.permission.RECORD_AUDIO
+                            )
+                        }
                     },
                     onSnapshot = {
                         streamController.captureSnapshot(context) {
@@ -279,9 +352,11 @@ private fun CameraMediaControls(
     muted: Boolean,
     volumePercent: Int,
     recording: Boolean,
+    talking: Boolean,
     onVolumeDown: () -> Unit,
     onToggleMute: () -> Unit,
     onVolumeUp: () -> Unit,
+    onToggleTalkback: () -> Unit,
     onSnapshot: () -> Unit,
     onToggleRecording: () -> Unit
 ) {
@@ -321,6 +396,18 @@ private fun CameraMediaControls(
                 }
             }
 
+            FilledTonalButton(
+                onClick = onToggleTalkback
+            ) {
+                Text(
+                    if (talking) {
+                        "🎙 Parar fala"
+                    } else {
+                        "🎤 Falar na câmera"
+                    }
+                )
+            }
+
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
@@ -335,10 +422,15 @@ private fun CameraMediaControls(
 
             if (recording) {
                 Text(
-                    "● REC",
+                    "● REC • salvando no armazenamento interno",
                     style = MaterialTheme.typography.labelLarge
                 )
             }
+
+            Text(
+                "Vídeos: Armazenamento interno > Movies > MeuCFTV",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
