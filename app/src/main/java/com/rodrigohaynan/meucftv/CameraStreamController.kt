@@ -66,6 +66,8 @@ class CameraStreamController {
     private var videoFramesSeen = 0L
     private var keyFramesSeen = 0L
     private var lastRecordedTimestampMs = Long.MIN_VALUE
+    private var cachedSps: ByteArray? = null
+    private var cachedPps: ByteArray? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -133,7 +135,21 @@ class CameraStreamController {
         }
 
         Thread {
-            val videoConfig = runCatching {
+            val cachedConfig = synchronized(recordLock) {
+                val sps = cachedSps
+                val pps = cachedPps
+
+                if (sps != null && pps != null) {
+                    RtspSdpProbe.VideoConfig(
+                        sps = sps.copyOf(),
+                        pps = pps.copyOf()
+                    )
+                } else {
+                    null
+                }
+            }
+
+            val videoConfig = cachedConfig ?: runCatching {
                 RtspSdpProbe.probe(config)
             }.getOrElse { error ->
                 failRecording(
@@ -337,11 +353,16 @@ class CameraStreamController {
             offset + length
         )
 
-        val keyFrame = isH264KeyFrame(
-            copied
-        )
+        val parameterSets = extractH264ParameterSets(copied)
+        val keyFrame = isH264KeyFrame(copied)
 
         synchronized(recordLock) {
+            parameterSets.first?.let {
+                cachedSps = it
+            }
+            parameterSets.second?.let {
+                cachedPps = it
+            }
             videoFramesSeen++
 
             if (keyFrame) {
@@ -483,6 +504,73 @@ class CameraStreamController {
                     (error.message ?: error.javaClass.simpleName)
             )
         }
+    }
+
+    private fun extractH264ParameterSets(
+        data: ByteArray
+    ): Pair<ByteArray?, ByteArray?> {
+        var foundSps: ByteArray? = null
+        var foundPps: ByteArray? = null
+
+        val starts = ArrayList<Pair<Int, Int>>()
+        var index = 0
+
+        while (index < data.size - 3) {
+            val startCodeLength = when {
+                index + 3 < data.size &&
+                    data[index] == 0.toByte() &&
+                    data[index + 1] == 0.toByte() &&
+                    data[index + 2] == 0.toByte() &&
+                    data[index + 3] == 1.toByte() -> 4
+
+                data[index] == 0.toByte() &&
+                    data[index + 1] == 0.toByte() &&
+                    data[index + 2] == 1.toByte() -> 3
+
+                else -> 0
+            }
+
+            if (startCodeLength > 0) {
+                starts += index to startCodeLength
+                index += startCodeLength
+            } else {
+                index++
+            }
+        }
+
+        starts.forEachIndexed { position, start ->
+            val nalStart = start.first + start.second
+            val nalEnd =
+                if (position + 1 < starts.size) {
+                    starts[position + 1].first
+                } else {
+                    data.size
+                }
+
+            if (nalStart >= nalEnd) {
+                return@forEachIndexed
+            }
+
+            val nalType =
+                data[nalStart].toInt() and 0x1f
+
+            if (nalType != 7 && nalType != 8) {
+                return@forEachIndexed
+            }
+
+            val payload = data.copyOfRange(
+                start.first,
+                nalEnd
+            )
+
+            if (nalType == 7) {
+                foundSps = payload
+            } else {
+                foundPps = payload
+            }
+        }
+
+        return foundSps to foundPps
     }
 
     private fun isH264KeyFrame(
