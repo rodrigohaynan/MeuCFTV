@@ -17,11 +17,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.alexvas.rtsp.widget.RtspDataListener
+import com.alexvas.rtsp.widget.RtspStatusListener
 import com.alexvas.rtsp.widget.RtspSurfaceView
 
 @Composable
 fun RtspPlayer(
     config: CameraConfig,
+    controller: CameraStreamController,
+    onAudioDetected: () -> Unit,
+    onStatus: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     key(
@@ -32,6 +37,7 @@ fun RtspPlayer(
         config.password
     ) {
         var view by remember { mutableStateOf<RtspSurfaceView?>(null) }
+        var audioReported by remember { mutableStateOf(false) }
 
         val uri = remember(
             config.host,
@@ -44,24 +50,79 @@ fun RtspPlayer(
         fun startStream(target: RtspSurfaceView) {
             runCatching { target.stop() }
 
+            target.setStatusListener(object : RtspStatusListener {
+                override fun onRtspStatusConnecting() {
+                    target.post { onStatus("Conectando vídeo e áudio...") }
+                }
+
+                override fun onRtspStatusConnected() {
+                    target.post { onStatus("RTSP conectado") }
+                }
+
+                override fun onRtspStatusFailedUnauthorized() {
+                    target.post { onStatus("Falha RTSP: usuário ou senha inválidos") }
+                }
+
+                override fun onRtspStatusFailed(message: String?) {
+                    target.post {
+                        onStatus("Falha RTSP: ${message ?: "erro desconhecido"}")
+                    }
+                }
+
+                override fun onRtspFirstFrameRendered() {
+                    target.post { onStatus("Vídeo ao vivo") }
+                }
+
+                override fun onRtspFrameSizeChanged(width: Int, height: Int) {
+                    controller.updateFrameSize(width, height)
+                }
+            })
+
+            target.setDataListener(object : RtspDataListener {
+                override fun onRtspDataVideoNalUnitReceived(
+                    data: ByteArray,
+                    offset: Int,
+                    length: Int,
+                    timestamp: Long
+                ) {
+                    controller.onVideoNalUnit(data, offset, length, timestamp)
+                }
+
+                override fun onRtspDataAudioSampleReceived(
+                    data: ByteArray,
+                    offset: Int,
+                    length: Int,
+                    timestamp: Long
+                ) {
+                    if (length > 0 && !audioReported) {
+                        audioReported = true
+                        target.post { onAudioDetected() }
+                    }
+                }
+            })
+
             target.init(
                 uri = uri,
                 username = config.rtspUser.ifBlank { null },
                 password = config.password.ifBlank { null },
-                userAgent = "MeuCFTV/0.1.2",
+                userAgent = "MeuCFTV/0.1.3",
                 socketTimeout = 7_000
             )
             target.debug = true
+            controller.attach(target)
             target.start(
                 requestVideo = true,
-                requestAudio = false,
+                requestAudio = true,
                 requestApplication = false
             )
         }
 
         DisposableEffect(Unit) {
             onDispose {
-                runCatching { view?.stop() }
+                view?.let { current ->
+                    controller.detach(current)
+                    runCatching { current.stop() }
+                }
             }
         }
 
@@ -84,7 +145,7 @@ fun RtspPlayer(
                     .align(Alignment.BottomCenter)
                     .padding(10.dp)
             ) {
-                Text("▶ Reconectar vídeo")
+                Text("▶ Reconectar")
             }
         }
     }
