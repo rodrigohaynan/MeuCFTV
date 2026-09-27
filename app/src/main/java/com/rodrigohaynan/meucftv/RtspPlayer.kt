@@ -1,17 +1,24 @@
 package com.rodrigohaynan.meucftv
 
 import android.net.Uri
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import org.videolan.libvlc.LibVLC
-import org.videolan.libvlc.Media
-import org.videolan.libvlc.MediaPlayer
-import org.videolan.libvlc.util.VLCVideoLayout
+import com.alexvas.rtsp.RtspClient
+import com.alexvas.rtsp.widget.RtspSurfaceView
 
 @Composable
 fun RtspPlayer(
@@ -25,64 +32,67 @@ fun RtspPlayer(
         config.rtspUser,
         config.password
     ) {
-        val context = LocalContext.current
+        var view by remember { mutableStateOf<RtspSurfaceView?>(null) }
 
-        val libVlc = remember {
-            LibVLC(
-                context.applicationContext,
-                arrayListOf(
-                    "--rtsp-tcp",
-                    "--network-caching=700",
-                    "--clock-jitter=0",
-                    "--clock-synchro=0"
-                )
+        val uri = remember(
+            config.host,
+            config.rtspPort,
+            config.rtspPath
+        ) {
+            buildRtspUri(config)
+        }
+
+        fun startStream(target: RtspSurfaceView) {
+            runCatching { target.stop() }
+
+            target.init(
+                uri = uri,
+                username = config.rtspUser.ifBlank { null },
+                password = config.password.ifBlank { null },
+                userAgent = "MeuCFTV/0.1.2",
+                socketTimeout = 7_000,
+                transport = RtspClient.Transport.TCP
+            )
+            target.debug = true
+            target.start(
+                requestVideo = true,
+                requestAudio = false,
+                requestApplication = false
             )
         }
 
-        val mediaPlayer = remember(libVlc) {
-            MediaPlayer(libVlc)
-        }
-
-        DisposableEffect(mediaPlayer, libVlc) {
+        DisposableEffect(Unit) {
             onDispose {
-                runCatching { mediaPlayer.stop() }
-                runCatching { mediaPlayer.detachViews() }
-                mediaPlayer.release()
-                libVlc.release()
+                runCatching { view?.stop() }
             }
         }
 
-        AndroidView(
-            modifier = modifier,
-            factory = { viewContext ->
-                VLCVideoLayout(viewContext).also { videoLayout ->
-                    mediaPlayer.attachViews(
-                        videoLayout,
-                        null,
-                        false,
-                        false
-                    )
-
-                    val media = Media(libVlc, buildRtspUri(config)).apply {
-                        setHWDecoderEnabled(true, false)
-                        addOption(":rtsp-tcp")
-                        addOption(":network-caching=700")
+        Box(modifier = modifier) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { context ->
+                    RtspSurfaceView(context).also { rtspView ->
+                        view = rtspView
+                        startStream(rtspView)
                     }
-
-                    mediaPlayer.media = media
-                    media.release()
-                    mediaPlayer.play()
                 }
+            )
+
+            FilledTonalButton(
+                onClick = {
+                    view?.let { startStream(it) }
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(10.dp)
+            ) {
+                Text("▶ Reconectar vídeo")
             }
-        )
+        }
     }
 }
 
 private fun buildRtspUri(config: CameraConfig): Uri {
-    val user = Uri.encode(config.rtspUser)
-    val password = Uri.encode(config.password)
-    val credentials = if (user.isNotBlank()) "$user:$password@" else ""
-
     val path = if (config.rtspPath.startsWith("/")) {
         config.rtspPath
     } else {
@@ -90,6 +100,6 @@ private fun buildRtspUri(config: CameraConfig): Uri {
     }
 
     return Uri.parse(
-        "rtsp://$credentials${config.host}:${config.rtspPort}$path"
+        "rtsp://${config.host}:${config.rtspPort}$path"
     )
 }
