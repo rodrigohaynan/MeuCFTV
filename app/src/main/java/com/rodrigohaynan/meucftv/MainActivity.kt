@@ -1,8 +1,5 @@
 package com.rodrigohaynan.meucftv
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -16,10 +13,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -44,33 +43,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        requestLocalNetworkPermissionIfNeeded()
-
         setContent {
             MaterialTheme {
                 MeuCftvApp()
             }
         }
     }
-
-    private fun requestLocalNetworkPermissionIfNeeded() {
-        if (
-            Build.VERSION.SDK_INT >= 37 &&
-            checkSelfPermission(Manifest.permission.ACCESS_LOCAL_NETWORK) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(
-                arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK),
-                REQUEST_LOCAL_NETWORK
-            )
-        }
-    }
-
-    companion object {
-        private const val REQUEST_LOCAL_NETWORK = 1001
-    }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MeuCftvApp() {
     val context = androidx.compose.ui.platform.LocalContext.current
