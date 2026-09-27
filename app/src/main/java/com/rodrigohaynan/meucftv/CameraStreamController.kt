@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaCodec
+import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
@@ -15,7 +16,7 @@ import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.view.PixelCopy
 import com.alexvas.rtsp.widget.RtspSurfaceView
-import java.io.ByteArrayOutputStream
+import com.alexvas.utils.VideoCodecUtils
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -50,9 +51,9 @@ class CameraStreamController {
     private var firstTimestampMs = Long.MIN_VALUE
     private var lastPtsUs = -1L
     private var writtenSamples = 0
-
-    private var sps: ByteArray? = null
-    private var pps: ByteArray? = null
+    private var muxerReady = false
+    private var waitingForKeyFrame = true
+    private var statusCallback: ((String) -> Unit)? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -73,22 +74,121 @@ class CameraStreamController {
 
     fun isRecording(): Boolean = recordingRequested
 
-    fun startRecording(context: Context, onStatus: (String) -> Unit) {
+    fun startRecording(
+        context: Context,
+        config: CameraConfig,
+        onStatus: (String) -> Unit
+    ) {
+        val appContext = context.applicationContext
+
         synchronized(recordLock) {
             if (recordingRequested) {
                 onMain { onStatus("Gravação já está em andamento") }
                 return
             }
 
-            recordingContext = context.applicationContext
+            val output = runCatching {
+                createVideoOutput(appContext)
+            }.getOrElse { error ->
+                onMain {
+                    onStatus(
+                        "Falha ao criar arquivo: " +
+                            (error.message ?: "erro desconhecido")
+                    )
+                }
+                return
+            }
+
+            recordingContext = appContext
             recordingRequested = true
+            recordingUri = output.uri
+            fallbackRecordingFile = output.file
+            parcelFileDescriptor = output.pfd
+            recordingDisplayName = output.displayName
             firstTimestampMs = Long.MIN_VALUE
             lastPtsUs = -1L
             writtenSamples = 0
+            muxerReady = false
+            waitingForKeyFrame = true
+            statusCallback = onStatus
+
+            onMain {
+                onStatus(
+                    "REC preparado • arquivo criado em Movies/MeuCFTV/" +
+                        output.displayName
+                )
+            }
         }
 
-        onMain {
-            onStatus("REC iniciado • aguardando quadro-chave")
+        Thread {
+            val videoConfig = runCatching {
+                RtspSdpProbe.probe(config)
+            }.getOrElse { error ->
+                failRecording(
+                    "Falha ao preparar gravação: " +
+                        (error.message ?: error.javaClass.simpleName)
+                )
+                return@Thread
+            }
+
+            synchronized(recordLock) {
+                if (!recordingRequested) return@Thread
+
+                val width = frameWidth.takeIf { it > 0 } ?: 1920
+                val height = frameHeight.takeIf { it > 0 } ?: 1080
+                val pfd = parcelFileDescriptor ?: return@Thread
+
+                val localMuxer = runCatching {
+                    MediaMuxer(
+                        pfd.fileDescriptor,
+                        MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+                    )
+                }.getOrElse { error ->
+                    failRecordingLocked(
+                        "Falha ao abrir MP4: " +
+                            (error.message ?: error.javaClass.simpleName)
+                    )
+                    return@Thread
+                }
+
+                val format = MediaFormat.createVideoFormat(
+                    MediaFormat.MIMETYPE_VIDEO_AVC,
+                    width,
+                    height
+                ).apply {
+                    setByteBuffer(
+                        "csd-0",
+                        ByteBuffer.wrap(videoConfig.sps)
+                    )
+                    setByteBuffer(
+                        "csd-1",
+                        ByteBuffer.wrap(videoConfig.pps)
+                    )
+                }
+
+                runCatching {
+                    videoTrackIndex = localMuxer.addTrack(format)
+                    localMuxer.start()
+                    muxer = localMuxer
+                    muxerReady = true
+                }.onFailure { error ->
+                    runCatching { localMuxer.release() }
+                    failRecordingLocked(
+                        "Falha ao iniciar MP4: " +
+                            (error.message ?: error.javaClass.simpleName)
+                    )
+                    return@Thread
+                }
+
+                onMain {
+                    statusCallback?.invoke(
+                        "REC ativo • aguardando próximo quadro-chave H.264"
+                    )
+                }
+            }
+        }.apply {
+            name = "MeuCFTV-SDP-Probe"
+            start()
         }
     }
 
@@ -96,48 +196,34 @@ class CameraStreamController {
         val message: String
 
         synchronized(recordLock) {
-            recordingRequested = false
-
-            val currentMuxer = muxer
-            val currentUri = recordingUri
-            val currentContext = recordingContext
-            val sampleCount = writtenSamples
-
-            if (currentMuxer == null) {
-                resetRecordingState()
-                message = "Gravação cancelada antes do primeiro quadro-chave"
-            } else {
-                runCatching {
-                    if (sampleCount > 0) {
-                        currentMuxer.stop()
-                    }
-                }
-                runCatching { currentMuxer.release() }
-                runCatching { parcelFileDescriptor?.close() }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && currentUri != null && currentContext != null) {
-                    if (sampleCount > 0) {
-                        val values = ContentValues().apply {
-                            put(MediaStore.Video.Media.IS_PENDING, 0)
-                        }
-                        runCatching {
-                            currentContext.contentResolver.update(currentUri, values, null, null)
-                        }
-                    } else {
-                        runCatching {
-                            currentContext.contentResolver.delete(currentUri, null, null)
-                        }
-                    }
-                }
-
-                message = if (sampleCount > 0) {
-                    "Vídeo salvo no armazenamento interno: Movies/MeuCFTV/${recordingDisplayName ?: "MeuCFTV.mp4"}"
-                } else {
-                    "Nenhum quadro foi gravado"
-                }
-
-                resetRecordingState()
+            if (!recordingRequested) {
+                onMain { onStatus("Nenhuma gravação em andamento") }
+                return
             }
+
+            recordingRequested = false
+            val sampleCount = writtenSamples
+            val currentMuxer = muxer
+
+            if (currentMuxer != null && muxerReady) {
+                runCatching { currentMuxer.stop() }
+                runCatching { currentMuxer.release() }
+            }
+
+            runCatching { parcelFileDescriptor?.close() }
+
+            val success = sampleCount > 0
+
+            finalizeMediaStore(success)
+
+            message = if (success) {
+                "Vídeo salvo: Armazenamento interno > Movies > MeuCFTV > " +
+                    (recordingDisplayName ?: "MeuCFTV.mp4")
+            } else {
+                "Nenhum quadro H.264 foi gravado; arquivo incompleto removido"
+            }
+
+            resetRecordingState()
         }
 
         onMain { onStatus(message) }
@@ -146,14 +232,27 @@ class CameraStreamController {
     fun captureSnapshot(context: Context, onStatus: (String) -> Unit) {
         val view = surfaceView
 
-        if (view == null || view.width <= 0 || view.height <= 0 || !view.holder.surface.isValid) {
-            onMain { onStatus("Não foi possível capturar: vídeo ainda não está pronto") }
+        if (
+            view == null ||
+            view.width <= 0 ||
+            view.height <= 0 ||
+            !view.holder.surface.isValid
+        ) {
+            onMain {
+                onStatus(
+                    "Não foi possível capturar: vídeo ainda não está pronto"
+                )
+            }
             return
         }
 
         val width = if (frameWidth > 0) frameWidth else view.width
         val height = if (frameHeight > 0) frameHeight else view.height
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmap = Bitmap.createBitmap(
+            width,
+            height,
+            Bitmap.Config.ARGB_8888
+        )
 
         val thread = HandlerThread("MeuCFTV-PixelCopy").apply { start() }
         val handler = Handler(thread.looper)
@@ -166,13 +265,18 @@ class CameraStreamController {
 
                 if (result != PixelCopy.SUCCESS) {
                     bitmap.recycle()
-                    onMain { onStatus("Falha ao capturar imagem • código $result") }
+                    onMain {
+                        onStatus("Falha ao capturar imagem • código $result")
+                    }
                     return@request
                 }
 
                 Thread {
                     val saved = runCatching {
-                        saveSnapshot(context.applicationContext, bitmap)
+                        saveSnapshot(
+                            context.applicationContext,
+                            bitmap
+                        )
                     }.getOrNull()
 
                     bitmap.recycle()
@@ -196,41 +300,51 @@ class CameraStreamController {
         length: Int,
         timestampMs: Long
     ) {
-        val nals = splitAnnexB(data, offset, length)
-        if (nals.isEmpty()) return
-
-        nals.forEach { nal ->
-            when (nal.type) {
-                7 -> sps = withStartCode(nal.payload)
-                8 -> pps = withStartCode(nal.payload)
-            }
-        }
-
-        if (!recordingRequested) return
+        if (!recordingRequested || length <= 0) return
 
         synchronized(recordLock) {
-            if (!recordingRequested) return
+            if (!recordingRequested || !muxerReady) return
 
-            val isKeyFrame = nals.any { it.type == 5 }
+            val localMuxer = muxer ?: return
+            val trackIndex = videoTrackIndex
+            if (trackIndex < 0) return
 
-            if (muxer == null) {
-                if (!isKeyFrame) return
-                if (sps == null || pps == null || frameWidth <= 0 || frameHeight <= 0) return
+            val keyFrame = VideoCodecUtils.isAnyKeyFrame(
+                data,
+                offset,
+                minOf(length, 1024),
+                false
+            )
 
-                val context = recordingContext ?: return
-                if (!createMuxer(context)) return
-            }
+            if (waitingForKeyFrame) {
+                if (!keyFrame) return
 
-            if (firstTimestampMs == Long.MIN_VALUE) {
-                if (!isKeyFrame) return
+                waitingForKeyFrame = false
                 firstTimestampMs = timestampMs
+
+                onMain {
+                    statusCallback?.invoke(
+                        "● REC gravando • " +
+                            (recordingDisplayName ?: "MeuCFTV.mp4")
+                    )
+                }
             }
 
-            val sample = buildVideoSample(nals)
-            if (sample.isEmpty()) return
+            val sample = data.copyOfRange(
+                offset,
+                offset + length
+            )
 
-            val calculatedPts = max(0L, (timestampMs - firstTimestampMs) * 1_000L)
-            val ptsUs = if (calculatedPts <= lastPtsUs) lastPtsUs + 1L else calculatedPts
+            val calculatedPtsUs =
+                max(0L, (timestampMs - firstTimestampMs) * 1_000L)
+
+            val ptsUs =
+                if (calculatedPtsUs <= lastPtsUs) {
+                    lastPtsUs + 1L
+                } else {
+                    calculatedPtsUs
+                }
+
             lastPtsUs = ptsUs
 
             val info = MediaCodec.BufferInfo().apply {
@@ -238,83 +352,107 @@ class CameraStreamController {
                     0,
                     sample.size,
                     ptsUs,
-                    if (isKeyFrame) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                    if (keyFrame) {
+                        MediaCodec.BUFFER_FLAG_KEY_FRAME
+                    } else {
+                        0
+                    }
                 )
             }
 
             runCatching {
-                muxer?.writeSampleData(
-                    videoTrackIndex,
+                localMuxer.writeSampleData(
+                    trackIndex,
                     ByteBuffer.wrap(sample),
                     info
                 )
                 writtenSamples++
+            }.onFailure { error ->
+                failRecordingLocked(
+                    "Erro ao gravar quadro: " +
+                        (error.message ?: error.javaClass.simpleName)
+                )
             }
         }
     }
 
-    private fun createMuxer(context: Context): Boolean {
-        return runCatching {
-            val output = createVideoOutput(context)
-            recordingDisplayName = output.displayName
-            recordingUri = output.uri
-            fallbackRecordingFile = output.file
-            parcelFileDescriptor = output.pfd
-
-            val localMuxer = MediaMuxer(
-                output.pfd.fileDescriptor,
-                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
-            )
-
-            val format = android.media.MediaFormat.createVideoFormat(
-                android.media.MediaFormat.MIMETYPE_VIDEO_AVC,
-                frameWidth,
-                frameHeight
-            ).apply {
-                setByteBuffer("csd-0", ByteBuffer.wrap(sps!!))
-                setByteBuffer("csd-1", ByteBuffer.wrap(pps!!))
-            }
-
-            videoTrackIndex = localMuxer.addTrack(format)
-            localMuxer.start()
-            muxer = localMuxer
-            true
-        }.getOrElse {
-            cleanupFailedRecording(context)
-            false
+    private fun failRecording(message: String) {
+        synchronized(recordLock) {
+            failRecordingLocked(message)
         }
     }
 
-    private fun cleanupFailedRecording(context: Context) {
+    private fun failRecordingLocked(message: String) {
+        if (!recordingRequested) return
+
+        recordingRequested = false
+
+        runCatching {
+            if (muxerReady) {
+                muxer?.stop()
+            }
+        }
         runCatching { muxer?.release() }
         runCatching { parcelFileDescriptor?.close() }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            recordingUri?.let { uri ->
-                runCatching { context.contentResolver.delete(uri, null, null) }
-            }
-        } else {
-            runCatching { fallbackRecordingFile?.delete() }
-        }
+        finalizeMediaStore(false)
+        resetRecordingState()
 
-        muxer = null
-        parcelFileDescriptor = null
-        recordingUri = null
-        fallbackRecordingFile = null
-        videoTrackIndex = -1
+        onMain {
+            statusCallback?.invoke(message)
+        }
+    }
+
+    private fun finalizeMediaStore(success: Boolean) {
+        val context = recordingContext ?: return
+        val uri = recordingUri
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (uri != null) {
+                if (success) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Video.Media.IS_PENDING, 0)
+                    }
+
+                    runCatching {
+                        context.contentResolver.update(
+                            uri,
+                            values,
+                            null,
+                            null
+                        )
+                    }
+                } else {
+                    runCatching {
+                        context.contentResolver.delete(
+                            uri,
+                            null,
+                            null
+                        )
+                    }
+                }
+            }
+        } else if (!success) {
+            runCatching {
+                fallbackRecordingFile?.delete()
+            }
+        }
     }
 
     private fun resetRecordingState() {
         muxer = null
+        videoTrackIndex = -1
         parcelFileDescriptor = null
         recordingUri = null
         fallbackRecordingFile = null
-        videoTrackIndex = -1
+        recordingDisplayName = null
         firstTimestampMs = Long.MIN_VALUE
         lastPtsUs = -1L
         writtenSamples = 0
+        muxerReady = false
+        waitingForKeyFrame = true
         recordingContext = null
-        recordingDisplayName = null
+        statusCallback = null
     }
 
     private data class OutputTarget(
@@ -329,13 +467,22 @@ class CameraStreamController {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(
+                    MediaStore.Video.Media.DISPLAY_NAME,
+                    fileName
+                )
+                put(
+                    MediaStore.Video.Media.MIME_TYPE,
+                    "video/mp4"
+                )
                 put(
                     MediaStore.Video.Media.RELATIVE_PATH,
                     Environment.DIRECTORY_MOVIES + "/MeuCFTV"
                 )
-                put(MediaStore.Video.Media.IS_PENDING, 1)
+                put(
+                    MediaStore.Video.Media.IS_PENDING,
+                    1
+                )
             }
 
             val uri = context.contentResolver.insert(
@@ -343,14 +490,23 @@ class CameraStreamController {
                 values
             ) ?: error("Não foi possível criar o arquivo de vídeo")
 
-            val pfd = context.contentResolver.openFileDescriptor(uri, "rw")
-                ?: error("Não foi possível abrir o arquivo de vídeo")
+            val pfd = context.contentResolver.openFileDescriptor(
+                uri,
+                "rw"
+            ) ?: error("Não foi possível abrir o arquivo de vídeo")
 
-            return OutputTarget(uri, null, pfd, fileName)
+            return OutputTarget(
+                uri,
+                null,
+                pfd,
+                fileName
+            )
         }
 
         val directory = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_MOVIES),
+            context.getExternalFilesDir(
+                Environment.DIRECTORY_MOVIES
+            ),
             "MeuCFTV"
         ).apply { mkdirs() }
 
@@ -362,21 +518,38 @@ class CameraStreamController {
                 ParcelFileDescriptor.MODE_TRUNCATE
         )
 
-        return OutputTarget(Uri.fromFile(file), file, pfd, fileName)
+        return OutputTarget(
+            Uri.fromFile(file),
+            file,
+            pfd,
+            fileName
+        )
     }
 
-    private fun saveSnapshot(context: Context, bitmap: Bitmap): Uri? {
+    private fun saveSnapshot(
+        context: Context,
+        bitmap: Bitmap
+    ): Uri? {
         val fileName = "MeuCFTV_${timestampForFile()}.jpg"
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(
+                    MediaStore.Images.Media.DISPLAY_NAME,
+                    fileName
+                )
+                put(
+                    MediaStore.Images.Media.MIME_TYPE,
+                    "image/jpeg"
+                )
                 put(
                     MediaStore.Images.Media.RELATIVE_PATH,
                     Environment.DIRECTORY_PICTURES + "/MeuCFTV"
                 )
-                put(MediaStore.Images.Media.IS_PENDING, 1)
+                put(
+                    MediaStore.Images.Media.IS_PENDING,
+                    1
+                )
             }
 
             val uri = context.contentResolver.insert(
@@ -384,30 +557,58 @@ class CameraStreamController {
                 values
             ) ?: return null
 
-            val success = context.contentResolver.openOutputStream(uri)?.use { stream ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)
-            } ?: false
+            val success =
+                context.contentResolver
+                    .openOutputStream(uri)
+                    ?.use { stream ->
+                        bitmap.compress(
+                            Bitmap.CompressFormat.JPEG,
+                            95,
+                            stream
+                        )
+                    }
+                    ?: false
 
             if (!success) {
-                context.contentResolver.delete(uri, null, null)
+                context.contentResolver.delete(
+                    uri,
+                    null,
+                    null
+                )
                 return null
             }
 
             val ready = ContentValues().apply {
                 put(MediaStore.Images.Media.IS_PENDING, 0)
             }
-            context.contentResolver.update(uri, ready, null, null)
+
+            context.contentResolver.update(
+                uri,
+                ready,
+                null,
+                null
+            )
+
             return uri
         }
 
         val directory = File(
-            context.getExternalFilesDir(Environment.DIRECTORY_PICTURES),
+            context.getExternalFilesDir(
+                Environment.DIRECTORY_PICTURES
+            ),
             "MeuCFTV"
         ).apply { mkdirs() }
 
         val file = File(directory, fileName)
+
         FileOutputStream(file).use { stream ->
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)) {
+            if (
+                !bitmap.compress(
+                    Bitmap.CompressFormat.JPEG,
+                    95,
+                    stream
+                )
+            ) {
                 return null
             }
         }
@@ -415,97 +616,11 @@ class CameraStreamController {
         return Uri.fromFile(file)
     }
 
-    private data class NalUnit(
-        val type: Int,
-        val payload: ByteArray
-    )
-
-    private fun splitAnnexB(
-        data: ByteArray,
-        offset: Int,
-        length: Int
-    ): List<NalUnit> {
-        val end = offset + length
-        val starts = mutableListOf<Pair<Int, Int>>()
-        var index = offset
-
-        while (index < end - 3) {
-            val startCodeLength = when {
-                index + 3 < end &&
-                    data[index] == 0.toByte() &&
-                    data[index + 1] == 0.toByte() &&
-                    data[index + 2] == 0.toByte() &&
-                    data[index + 3] == 1.toByte() -> 4
-
-                data[index] == 0.toByte() &&
-                    data[index + 1] == 0.toByte() &&
-                    data[index + 2] == 1.toByte() -> 3
-
-                else -> 0
-            }
-
-            if (startCodeLength > 0) {
-                starts += index to startCodeLength
-                index += startCodeLength
-            } else {
-                index++
-            }
-        }
-
-        if (starts.isEmpty()) {
-            if (length <= 0) return emptyList()
-            val payload = data.copyOfRange(offset, end)
-            return listOf(
-                NalUnit(
-                    type = payload[0].toInt() and 0x1F,
-                    payload = payload
-                )
-            )
-        }
-
-        val result = mutableListOf<NalUnit>()
-
-        starts.forEachIndexed { position, start ->
-            val nalStart = start.first + start.second
-            val nalEnd = if (position + 1 < starts.size) {
-                starts[position + 1].first
-            } else {
-                end
-            }
-
-            if (nalEnd > nalStart) {
-                val payload = data.copyOfRange(nalStart, nalEnd)
-                result += NalUnit(
-                    type = payload[0].toInt() and 0x1F,
-                    payload = payload
-                )
-            }
-        }
-
-        return result
-    }
-
-    private fun buildVideoSample(nals: List<NalUnit>): ByteArray {
-        val out = ByteArrayOutputStream()
-
-        nals.forEach { nal ->
-            if (nal.type == 7 || nal.type == 8 || nal.type == 9) return@forEach
-            out.write(START_CODE)
-            out.write(nal.payload)
-        }
-
-        return out.toByteArray()
-    }
-
-    private fun withStartCode(payload: ByteArray): ByteArray {
-        val result = ByteArray(START_CODE.size + payload.size)
-        START_CODE.copyInto(result, 0)
-        payload.copyInto(result, START_CODE.size)
-        return result
-    }
-
     private fun timestampForFile(): String =
-        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        SimpleDateFormat(
+            "yyyyMMdd_HHmmss",
+            Locale.US
+        ).format(Date())
 
     private fun onMain(block: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -513,9 +628,5 @@ class CameraStreamController {
         } else {
             mainHandler.post(block)
         }
-    }
-
-    companion object {
-        private val START_CODE = byteArrayOf(0, 0, 0, 1)
     }
 }
