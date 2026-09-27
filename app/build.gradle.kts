@@ -11,8 +11,8 @@ android {
         applicationId = "com.rodrigohaynan.meucftv"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     compileOptions {
@@ -40,9 +40,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
 
-    implementation("androidx.media3:media3-exoplayer:1.11.1")
-    implementation("androidx.media3:media3-exoplayer-rtsp:1.11.1")
-    implementation("androidx.media3:media3-ui:1.11.1")
+    implementation("org.videolan.android:libvlc-all:3.7.6")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
