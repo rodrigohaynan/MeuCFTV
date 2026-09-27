@@ -10,6 +10,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -30,6 +32,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -41,6 +44,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -66,6 +70,7 @@ private fun MeuCftvApp() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val store = remember { SecureCameraStore(context) }
     val streamController = remember { CameraStreamController() }
+    val recorder = remember { RtspRecorder() }
     val audioManager = remember {
         context.getSystemService(AudioManager::class.java)
     }
@@ -105,7 +110,15 @@ private fun MeuCftvApp() {
         TalkbackClient(config)
     }
 
-    fun beginTalkback() {
+    fun startTalkbackIfPermitted() {
+        if (
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            status = "Autorize o microfone e depois segure o botão novamente"
+            return
+        }
+
         if (talkback.isTalking()) return
 
         talking = true
@@ -123,22 +136,29 @@ private fun MeuCftvApp() {
         )
     }
 
+    fun stopTalkback() {
+        if (talkback.isTalking() || talking) {
+            talkback.stop()
+            talking = false
+            status = "Microfone desligado"
+        }
+    }
+
     val microphonePermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) {
-            beginTalkback()
+        status = if (granted) {
+            "Microfone autorizado • segure o botão para falar"
         } else {
-            status = "Permissão do microfone negada"
+            "Permissão do microfone negada"
         }
     }
 
     DisposableEffect(Unit) {
         onDispose {
             talkback.stop()
-
-            if (streamController.isRecording()) {
-                streamController.stopRecording { }
+            if (recorder.isRecording()) {
+                recorder.stop { }
             }
         }
     }
@@ -170,22 +190,18 @@ private fun MeuCftvApp() {
                 CameraSettings(
                     current = config,
                     onSave = { newConfig ->
-                        if (recording) {
-                            streamController.stopRecording {
-                                status = it
+                        if (recorder.isRecording()) {
+                            recorder.stop { message ->
+                                mainHandler.post { status = message }
                             }
-                            recording = false
                         }
 
-                        if (talking) {
-                            talkback.stop()
-                            talking = false
-                        }
-
+                        stopTalkback()
                         store.save(newConfig)
                         config = newConfig
                         showSettings = false
                         audioDetected = false
+                        recording = false
                         status = "Configuração salva"
                     }
                 )
@@ -259,22 +275,21 @@ private fun MeuCftvApp() {
                         muted = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
                         volumePercent = getVolumePercent(audioManager)
                     },
-                    onToggleTalkback = {
-                        if (talking || talkback.isTalking()) {
-                            talkback.stop()
-                            talking = false
-                            status = "Microfone desligado"
-                        } else if (
+                    onTalkPress = {
+                        if (
                             context.checkSelfPermission(
                                 Manifest.permission.RECORD_AUDIO
                             ) == PackageManager.PERMISSION_GRANTED
                         ) {
-                            beginTalkback()
+                            startTalkbackIfPermitted()
                         } else {
                             microphonePermissionLauncher.launch(
                                 Manifest.permission.RECORD_AUDIO
                             )
                         }
+                    },
+                    onTalkRelease = {
+                        stopTalkback()
                     },
                     onSnapshot = {
                         streamController.captureSnapshot(context) {
@@ -282,16 +297,26 @@ private fun MeuCftvApp() {
                         }
                     },
                     onToggleRecording = {
-                        if (recording) {
-                            streamController.stopRecording {
-                                status = it
+                        if (recorder.isRecording()) {
+                            recorder.stop { message ->
+                                mainHandler.post { status = message }
                             }
-                            recording = false
                         } else {
-                            streamController.startRecording(context) {
-                                status = it
-                            }
                             recording = true
+                            recorder.start(
+                                context = context,
+                                config = config,
+                                onStatus = { message ->
+                                    mainHandler.post {
+                                        status = message
+                                    }
+                                },
+                                onStopped = {
+                                    mainHandler.post {
+                                        recording = false
+                                    }
+                                }
+                            )
                         }
                     }
                 )
@@ -356,7 +381,8 @@ private fun CameraMediaControls(
     onVolumeDown: () -> Unit,
     onToggleMute: () -> Unit,
     onVolumeUp: () -> Unit,
-    onToggleTalkback: () -> Unit,
+    onTalkPress: () -> Unit,
+    onTalkRelease: () -> Unit,
     onSnapshot: () -> Unit,
     onToggleRecording: () -> Unit
 ) {
@@ -396,17 +422,11 @@ private fun CameraMediaControls(
                 }
             }
 
-            FilledTonalButton(
-                onClick = onToggleTalkback
-            ) {
-                Text(
-                    if (talking) {
-                        "🎙 Parar fala"
-                    } else {
-                        "🎤 Falar na câmera"
-                    }
-                )
-            }
+            PressToTalkButton(
+                talking = talking,
+                onPress = onTalkPress,
+                onRelease = onTalkRelease
+            )
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -422,7 +442,7 @@ private fun CameraMediaControls(
 
             if (recording) {
                 Text(
-                    "● REC • salvando no armazenamento interno",
+                    "● REC • arquivo criado no armazenamento interno",
                     style = MaterialTheme.typography.labelLarge
                 )
             }
@@ -432,6 +452,46 @@ private fun CameraMediaControls(
                 style = MaterialTheme.typography.bodySmall
             )
         }
+    }
+}
+
+@Composable
+private fun PressToTalkButton(
+    talking: Boolean,
+    onPress: () -> Unit,
+    onRelease: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(28.dp),
+        color = if (talking) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.secondaryContainer
+        },
+        modifier = Modifier.pointerInput(talking) {
+            detectTapGestures(
+                onPress = {
+                    onPress()
+                    try {
+                        tryAwaitRelease()
+                    } finally {
+                        onRelease()
+                    }
+                }
+            )
+        }
+    ) {
+        Text(
+            text = if (talking) {
+                "🎙 Falando... solte para parar"
+            } else {
+                "🎤 Segure para falar"
+            },
+            modifier = Modifier.padding(
+                horizontal = 24.dp,
+                vertical = 14.dp
+            )
+        )
     }
 }
 
