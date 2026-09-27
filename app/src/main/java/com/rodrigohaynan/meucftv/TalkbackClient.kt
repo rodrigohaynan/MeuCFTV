@@ -159,7 +159,7 @@ class TalkbackClient(
         localSocket.soTimeout = 0
 
         val minimum = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
+            CAPTURE_SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
@@ -171,13 +171,13 @@ class TalkbackClient(
         }
 
         val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            CAPTURE_SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             max(
                 minimum,
-                CHUNK_SIZE * 16
+                CAPTURE_CHUNK_SIZE * 16
             )
         )
 
@@ -197,7 +197,7 @@ class TalkbackClient(
             "🎙 Falando na câmera • Yoosee AudioCtlCmd ativo"
         )
 
-        val chunk = ByteArray(CHUNK_SIZE)
+        val captureChunk = ByteArray(CAPTURE_CHUNK_SIZE)
         val prebuffer = ArrayList<ByteArray>(
             PREBUFFER_PACKETS
         )
@@ -209,17 +209,14 @@ class TalkbackClient(
             running.get() &&
             prebuffer.size < PREBUFFER_PACKETS
         ) {
-            val complete = readPcmChunk(
+            val captured = readPcmChunk(
                 recorder,
-                chunk
+                captureChunk
             ) ?: continue
 
-            applyPcmGain(
-                complete,
-                TALKBACK_GAIN
+            prebuffer += downsampleToCameraPcm(
+                captured
             )
-
-            prebuffer += complete
         }
 
         var totalBytesSent = 0L
@@ -241,14 +238,13 @@ class TalkbackClient(
                 1_000_000L
 
         while (running.get()) {
-            val complete = readPcmChunk(
+            val captured = readPcmChunk(
                 recorder,
-                chunk
+                captureChunk
             ) ?: continue
 
-            applyPcmGain(
-                complete,
-                TALKBACK_GAIN
+            val complete = downsampleToCameraPcm(
+                captured
             )
 
             while (running.get()) {
@@ -264,7 +260,7 @@ class TalkbackClient(
                             1_000L
                         ) /
                         (
-                            SAMPLE_RATE *
+                            CAMERA_SAMPLE_RATE *
                                 2L
                             )
 
@@ -349,47 +345,51 @@ class TalkbackClient(
         return reusable.copyOf()
     }
 
-    private fun applyPcmGain(
-        pcm: ByteArray,
-        gain: Float
-    ) {
-        var index = 0
+    private fun downsampleToCameraPcm(
+        input: ByteArray
+    ): ByteArray {
+        val output = ByteArray(CAMERA_CHUNK_SIZE)
+        var inputOffset = 0
+        var outputOffset = 0
 
-        while (index + 1 < pcm.size) {
-            val sample =
+        while (
+            inputOffset + 3 < input.size &&
+            outputOffset + 1 < output.size
+        ) {
+            val first =
                 (
-                    (pcm[index + 1].toInt() shl 8) or
-                        (pcm[index].toInt() and 0xff)
-                    ).toShort()
+                    (input[inputOffset + 1].toInt() shl 8) or
+                        (input[inputOffset].toInt() and 0xff)
+                    ).toShort().toInt()
+
+            val second =
+                (
+                    (input[inputOffset + 3].toInt() shl 8) or
+                        (input[inputOffset + 2].toInt() and 0xff)
+                    ).toShort().toInt()
+
+            val averaged =
+                ((first + second) / 2)
 
             val scaled =
-                (
-                    sample.toInt() *
-                        gain
-                    )
+                (averaged * TALKBACK_GAIN)
                     .toInt()
                     .coerceIn(
                         Short.MIN_VALUE.toInt(),
                         Short.MAX_VALUE.toInt()
                     )
-                    .toShort()
 
-            pcm[index] =
-                (
-                    scaled.toInt() and
-                        0xff
-                    ).toByte()
+            output[outputOffset] =
+                (scaled and 0xff).toByte()
 
-            pcm[index + 1] =
-                (
-                    (
-                        scaled.toInt()
-                            shr 8
-                        ) and 0xff
-                    ).toByte()
+            output[outputOffset + 1] =
+                ((scaled shr 8) and 0xff).toByte()
 
-            index += 2
+            inputOffset += 4
+            outputOffset += 2
         }
+
+        return output
     }
 
     private fun sendYooseeAudioFrame(
@@ -415,8 +415,10 @@ class TalkbackClient(
     }
 
     companion object {
-        private const val SAMPLE_RATE = 8_000
-        private const val CHUNK_SIZE = 320
+        private const val CAPTURE_SAMPLE_RATE = 16_000
+        private const val CAMERA_SAMPLE_RATE = 8_000
+        private const val CAPTURE_CHUNK_SIZE = 640
+        private const val CAMERA_CHUNK_SIZE = 320
         private const val PROPRIETARY_PADDING_SIZE = 12
 
         // 50 x 20 ms = roughly one second, matching the known-good
@@ -426,7 +428,7 @@ class TalkbackClient(
         private const val MAX_BUFFER_AHEAD_MS = 2_000L
 
         // Reduce clipping/AGC artifacts from phone microphones.
-        private const val TALKBACK_GAIN = 0.45f
+        private const val TALKBACK_GAIN = 0.80f
 
         private const val CONNECT_TIMEOUT_MS = 5_000
         private const val RESPONSE_TIMEOUT_MS = 3_000
