@@ -104,7 +104,8 @@ private fun MeuCftvApp() {
         config.rtspPort,
         config.rtspPath,
         config.rtspUser,
-        config.password
+        config.password,
+        config.talkbackCodec
     ) {
         TalkbackClient(config)
     }
@@ -239,6 +240,20 @@ private fun MeuCftvApp() {
                     volumePercent = volumePercent,
                     recording = recording,
                     talking = talking,
+                    talkbackCodec = config.talkbackCodec,
+                    onTalkbackCodecChange = { codec ->
+                        if (talking || talkback.isTalking()) {
+                            stopTalkback()
+                        }
+
+                        val updated = config.copy(
+                            talkbackCodec = codec
+                        )
+
+                        store.save(updated)
+                        config = updated
+                        status = "Modo de fala: ${codec.displayName}"
+                    },
                     onVolumeDown = {
                         audioManager.adjustStreamVolume(
                             AudioManager.STREAM_MUSIC,
@@ -373,6 +388,8 @@ private fun CameraMediaControls(
     volumePercent: Int,
     recording: Boolean,
     talking: Boolean,
+    talkbackCodec: TalkbackCodec,
+    onTalkbackCodecChange: (TalkbackCodec) -> Unit,
     onVolumeDown: () -> Unit,
     onToggleMute: () -> Unit,
     onVolumeUp: () -> Unit,
@@ -421,6 +438,45 @@ private fun CameraMediaControls(
                 talking = talking,
                 onPress = onTalkPress,
                 onRelease = onTalkRelease
+            )
+
+            Text(
+                "Codec de fala para a câmera",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                TalkbackCodec.entries.forEach { codec ->
+                    OutlinedButton(
+                        onClick = {
+                            onTalkbackCodecChange(codec)
+                        }
+                    ) {
+                        Text(
+                            if (codec == talkbackCodec) {
+                                "✓ " + when (codec) {
+                                    TalkbackCodec.PCM16 -> "PCM"
+                                    TalkbackCodec.G711A -> "G711A"
+                                    TalkbackCodec.G711U -> "G711U"
+                                }
+                            } else {
+                                when (codec) {
+                                    TalkbackCodec.PCM16 -> "PCM"
+                                    TalkbackCodec.G711A -> "G711A"
+                                    TalkbackCodec.G711U -> "G711U"
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
+            Text(
+                "Segure o microfone por alguns segundos. O status mostra " +
+                    "pacotes enviados e nível captado.",
+                style = MaterialTheme.typography.bodySmall
             )
 
             Row(
@@ -618,6 +674,41 @@ private fun CameraSettings(
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth()
             )
+
+            Text(
+                "Codec do microfone / talkback",
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                TalkbackCodec.entries.forEach { codec ->
+                    OutlinedButton(
+                        onClick = {
+                            draft = draft.copy(
+                                talkbackCodec = codec
+                            )
+                        }
+                    ) {
+                        Text(
+                            if (draft.talkbackCodec == codec) {
+                                "✓ " + when (codec) {
+                                    TalkbackCodec.PCM16 -> "PCM"
+                                    TalkbackCodec.G711A -> "G711A"
+                                    TalkbackCodec.G711U -> "G711U"
+                                }
+                            } else {
+                                when (codec) {
+                                    TalkbackCodec.PCM16 -> "PCM"
+                                    TalkbackCodec.G711A -> "G711A"
+                                    TalkbackCodec.G711U -> "G711U"
+                                }
+                            }
+                        )
+                    }
+                }
+            }
 
             Button(
                 onClick = { onSave(draft) },

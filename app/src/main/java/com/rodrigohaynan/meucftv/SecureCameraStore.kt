@@ -22,7 +22,15 @@ class SecureCameraStore(context: Context) {
         rtspPath = prefs.getString("rtsp_path", "/onvif1") ?: "/onvif1",
         rtspUser = prefs.getString("rtsp_user", "admin") ?: "admin",
         onvifUser = prefs.getString("onvif_user", "administrator") ?: "administrator",
-        password = decrypt(prefs.getString("password", null))
+        password = decrypt(prefs.getString("password", null)),
+        talkbackCodec = runCatching {
+            TalkbackCodec.valueOf(
+                prefs.getString(
+                    "talkback_codec",
+                    TalkbackCodec.PCM16.name
+                ) ?: TalkbackCodec.PCM16.name
+            )
+        }.getOrDefault(TalkbackCodec.PCM16)
     )
 
     fun save(config: CameraConfig) {
@@ -35,6 +43,10 @@ class SecureCameraStore(context: Context) {
             .putString("rtsp_user", config.rtspUser)
             .putString("onvif_user", config.onvifUser)
             .putString("password", encrypt(config.password))
+            .putString(
+                "talkback_codec",
+                config.talkbackCodec.name
+            )
             .apply()
     }
 
