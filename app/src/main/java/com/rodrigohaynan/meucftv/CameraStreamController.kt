@@ -28,6 +28,13 @@ import kotlin.math.max
 
 class CameraStreamController {
 
+    private enum class VideoCodec {
+        UNKNOWN,
+        AVC,
+        HEVC
+    }
+
+
     @Volatile
     private var surfaceView: RtspSurfaceView? = null
 
@@ -54,6 +61,15 @@ class CameraStreamController {
     private var statusCallback: ((String) -> Unit)? = null
 
     private var streamConfig: RtspSdpProbe.VideoConfig? = null
+
+    private var detectedVideoCodec = VideoCodec.UNKNOWN
+    private var hevcVps: ByteArray? = null
+    private var hevcSps: ByteArray? = null
+    private var hevcPps: ByteArray? = null
+    private var avcSps: ByteArray? = null
+    private var avcPps: ByteArray? = null
+    private var audioProbeCompleted = false
+    private var videoStarted = false
 
     private data class AccessUnit(
         val data: ByteArray,
@@ -118,52 +134,37 @@ class CameraStreamController {
         config: CameraConfig,
         onStatus: (String) -> Unit
     ) {
-        val appContext =
-            context.applicationContext
+        val appContext = context.applicationContext
 
         synchronized(recordLock) {
             if (recordingRequested) {
+                onMain { onStatus("Gravação já está em andamento") }
+                return
+            }
+
+            val output = runCatching {
+                createVideoOutput(appContext)
+            }.getOrElse { error ->
                 onMain {
                     onStatus(
-                        "Gravação já está em andamento"
+                        "Falha ao criar arquivo: " +
+                            (error.message ?: "erro desconhecido")
                     )
                 }
                 return
             }
 
-            val output =
-                runCatching {
-                    createVideoOutput(
-                        appContext
-                    )
-                }.getOrElse { error ->
-                    onMain {
-                        onStatus(
-                            "Falha ao criar arquivo: " +
-                                (
-                                    error.message
-                                        ?: "erro desconhecido"
-                                    )
-                        )
-                    }
-                    return
-                }
-
             recordingContext = appContext
             recordingRequested = true
             recordingUri = output.uri
-            fallbackRecordingFile =
-                output.file
-            parcelFileDescriptor =
-                output.pfd
-            recordingDisplayName =
-                output.displayName
+            fallbackRecordingFile = output.file
+            parcelFileDescriptor = output.pfd
+            recordingDisplayName = output.displayName
             statusCallback = onStatus
 
             videoTrackIndex = -1
             audioTrackIndex = -1
-            videoStartArrivalUs =
-                Long.MIN_VALUE
+            videoStartArrivalUs = Long.MIN_VALUE
             lastVideoPtsUs = -1L
             videoSamplesWritten = 0L
             videoUnitsSeen = 0L
@@ -171,145 +172,48 @@ class CameraStreamController {
             audioSamplesQueued = 0L
             audioFramesWritten = 0L
             muxerReady = false
+            videoStarted = false
+            audioProbeCompleted = false
+            streamConfig = null
 
             onMain {
                 onStatus(
-                    "REC preparado • arquivo criado em " +
-                        "Movies/MeuCFTV/" +
-                        output.displayName
+                    "REC preparado • " +
+                        codecLabel() +
+                        " • aguardando quadro-chave"
                 )
             }
         }
 
         Thread {
-            val probed =
-                runCatching {
-                    RtspSdpProbe.probe(
-                        config
-                    )
-                }.getOrElse { error ->
-                    failRecording(
-                        "Falha ao preparar gravação: " +
-                            (
-                                error.message
-                                    ?: error.javaClass
-                                        .simpleName
-                                )
-                    )
-                    return@Thread
-                }
+            val probe = runCatching {
+                RtspSdpProbe.probe(config)
+            }.getOrNull()
 
             synchronized(recordLock) {
                 if (!recordingRequested) {
                     return@Thread
                 }
 
-                streamConfig = probed
+                streamConfig = probe
+                audioProbeCompleted = true
 
-                val pfd =
-                    parcelFileDescriptor
-                        ?: return@Thread
-
-                val width =
-                    frameWidth
-                        .takeIf { it > 0 }
-                        ?: 1920
-                val height =
-                    frameHeight
-                        .takeIf { it > 0 }
-                        ?: 1080
-
-                val localMuxer =
-                    runCatching {
-                        MediaMuxer(
-                            pfd.fileDescriptor,
-                            MediaMuxer
-                                .OutputFormat
-                                .MUXER_OUTPUT_MPEG_4
-                        )
-                    }.getOrElse { error ->
-                        failRecordingLocked(
-                            "Falha ao abrir MP4: " +
-                                (
-                                    error.message
-                                        ?: error.javaClass
-                                            .simpleName
-                                    )
-                        )
-                        return@Thread
+                if (
+                    detectedVideoCodec == VideoCodec.AVC &&
+                    probe != null
+                ) {
+                    if (avcSps == null) {
+                        avcSps = probe.sps
                     }
-
-                val videoFormat =
-                    MediaFormat
-                        .createVideoFormat(
-                            MediaFormat
-                                .MIMETYPE_VIDEO_AVC,
-                            width,
-                            height
-                        )
-                        .apply {
-                            setByteBuffer(
-                                "csd-0",
-                                ByteBuffer.wrap(
-                                    probed.sps
-                                )
-                            )
-                            setByteBuffer(
-                                "csd-1",
-                                ByteBuffer.wrap(
-                                    probed.pps
-                                )
-                            )
-                        }
-
-                try {
-                    videoTrackIndex =
-                        localMuxer.addTrack(
-                            videoFormat
-                        )
-
-                    configureAudioTrackLocked(
-                        localMuxer,
-                        probed.audio
-                    )
-
-                    localMuxer.start()
-                    muxer = localMuxer
-                    muxerReady = true
-
-                    if (recentGop.isNotEmpty()) {
-                        val buffered =
-                            recentGop.toList()
-
-                        buffered.forEachIndexed { index, unit ->
-                            writeVideoAccessUnitLocked(
-                                unit,
-                                forceSync = index == 0
-                            )
-                        }
+                    if (avcPps == null) {
+                        avcPps = probe.pps
                     }
-
-                    onMain {
-                        statusCallback?.invoke(
-                            buildRecordingReadyMessage()
-                        )
-                    }
-                } catch (error: Exception) {
-                    runCatching {
-                        localMuxer.release()
-                    }
-                    failRecordingLocked(
-                        "Falha ao iniciar MP4: " +
-                            (
-                                error.message
-                                    ?: error.javaClass
-                                        .simpleName
-                                )
-                    )
                 }
+
+                tryStartMuxerLocked()
             }
         }.apply {
-            name = "MeuCFTV-Recorder-Setup"
+            name = "MeuCFTV-Recorder-Probe"
             start()
         }
     }
@@ -502,36 +406,33 @@ class CameraStreamController {
     ) {
         if (length <= 0) return
 
-        val nal =
-            data.copyOfRange(
-                offset,
-                offset + length
-            )
+        val nal = data.copyOfRange(
+            offset,
+            offset + length
+        )
 
-        val arrivalUs =
-            System.nanoTime() / 1_000L
+        val arrivalUs = System.nanoTime() / 1_000L
 
         synchronized(recordLock) {
+            analyzeVideoPacketLocked(nal)
+
             if (
-                pendingVideoTimestamp !=
-                Long.MIN_VALUE &&
-                timestamp !=
-                pendingVideoTimestamp
+                pendingVideoTimestamp != Long.MIN_VALUE &&
+                timestamp != pendingVideoTimestamp
             ) {
                 flushPendingVideoLocked()
             }
 
-            if (
-                pendingVideoTimestamp ==
-                Long.MIN_VALUE
-            ) {
-                pendingVideoTimestamp =
-                    timestamp
-                pendingVideoArrivalUs =
-                    arrivalUs
+            if (pendingVideoTimestamp == Long.MIN_VALUE) {
+                pendingVideoTimestamp = timestamp
+                pendingVideoArrivalUs = arrivalUs
             }
 
             pendingVideoNals += nal
+
+            if (recordingRequested) {
+                tryStartMuxerLocked()
+            }
         }
     }
 
@@ -547,6 +448,7 @@ class CameraStreamController {
             if (
                 !recordingRequested ||
                 !muxerReady ||
+                !videoStarted ||
                 audioTrackIndex < 0
             ) {
                 return
@@ -601,60 +503,61 @@ class CameraStreamController {
     private fun flushPendingVideoLocked() {
         if (
             pendingVideoNals.isEmpty() ||
-            pendingVideoTimestamp ==
-            Long.MIN_VALUE
+            pendingVideoTimestamp == Long.MIN_VALUE
         ) {
             return
         }
 
-        val unit =
-            buildAccessUnit(
-                pendingVideoNals,
-                pendingVideoTimestamp,
-                pendingVideoArrivalUs
-            )
+        val unit = buildAccessUnit(
+            pendingVideoNals,
+            pendingVideoTimestamp,
+            pendingVideoArrivalUs
+        )
 
         pendingVideoNals.clear()
-        pendingVideoTimestamp =
-            Long.MIN_VALUE
+        pendingVideoTimestamp = Long.MIN_VALUE
 
         videoUnitsSeen++
 
         if (unit.sync) {
             syncUnitsSeen++
-            recentGop.clear()
-            recentGopBytes = 0
         }
 
-        recentGop.addLast(unit)
-        recentGopBytes += unit.data.size
-        trimRecentGopLocked()
+        if (recordingRequested) {
+            tryStartMuxerLocked()
+        }
 
         if (
-            recordingRequested &&
-            muxerReady
+            !recordingRequested ||
+            !muxerReady
         ) {
-            if (videoSamplesWritten == 0L) {
-                writeVideoAccessUnitLocked(
-                    unit,
-                    forceSync = true
-                )
+            return
+        }
 
-                onMain {
-                    statusCallback?.invoke(
-                        if (unit.sync) {
-                            "● REC gravando • quadro de sincronização encontrado"
-                        } else {
-                            "● REC gravando • modo compatibilidade Yoosee"
-                        }
-                    )
-                }
-            } else {
-                writeVideoAccessUnitLocked(
-                    unit
+        if (!videoStarted) {
+            if (!unit.sync) {
+                return
+            }
+
+            videoStarted = true
+            videoStartArrivalUs = unit.arrivalUs
+            lastVideoPtsUs = -1L
+            audioSamplesQueued = 0L
+            audioFramesWritten = 0L
+
+            writeVideoAccessUnitLocked(unit)
+
+            onMain {
+                statusCallback?.invoke(
+                    "● REC gravando • " +
+                        codecLabel()
                 )
             }
+
+            return
         }
+
+        writeVideoAccessUnitLocked(unit)
     }
 
     private fun buildAccessUnit(
@@ -671,7 +574,7 @@ class CameraStreamController {
             out.write(nal)
 
             if (
-                isSyncNalOrSlice(
+                isSyncAccessUnit(
                     nal
                 )
             ) {
@@ -719,86 +622,403 @@ class CameraStreamController {
     }
 
     private fun writeVideoAccessUnitLocked(
-        unit: AccessUnit,
-        forceSync: Boolean = false
+        unit: AccessUnit
     ) {
-        val localMuxer =
-            muxer ?: return
+        val localMuxer = muxer ?: return
 
         if (videoTrackIndex < 0) {
             return
         }
 
-        // Android MediaMuxer expects H.264 access units in Annex-B form.
-        // RtspSurfaceView already delivers each NAL with 00 00 00 01 start
-        // codes, so pass the access unit through unchanged.
-        val mp4Sample = unit.data
+        val sample = stripParameterSetsForMux(
+            unit.data
+        )
 
-        if (mp4Sample.isEmpty()) {
+        if (sample.isEmpty()) {
             return
         }
 
-        if (
-            videoStartArrivalUs ==
-            Long.MIN_VALUE
-        ) {
-            videoStartArrivalUs =
-                unit.arrivalUs
+        if (videoStartArrivalUs == Long.MIN_VALUE) {
+            videoStartArrivalUs = unit.arrivalUs
         }
 
-        var ptsUs =
-            max(
-                0L,
-                unit.arrivalUs -
-                    videoStartArrivalUs
-            )
+        var ptsUs = max(
+            0L,
+            unit.arrivalUs -
+                videoStartArrivalUs
+        )
 
         if (ptsUs <= lastVideoPtsUs) {
-            ptsUs =
-                lastVideoPtsUs + 1L
+            ptsUs = lastVideoPtsUs + 1L
         }
 
         lastVideoPtsUs = ptsUs
 
-        val isSync =
-            unit.sync || forceSync
-
-        val info =
-            MediaCodec.BufferInfo()
-                .apply {
-                    set(
-                        0,
-                        mp4Sample.size,
-                        ptsUs,
-                        if (isSync) {
-                            MediaCodec
-                                .BUFFER_FLAG_KEY_FRAME
-                        } else {
-                            0
-                        }
-                    )
+        val info = MediaCodec.BufferInfo().apply {
+            set(
+                0,
+                sample.size,
+                ptsUs,
+                if (unit.sync) {
+                    MediaCodec.BUFFER_FLAG_KEY_FRAME
+                } else {
+                    0
                 }
+            )
+        }
 
         runCatching {
             localMuxer.writeSampleData(
                 videoTrackIndex,
-                ByteBuffer.wrap(
-                    mp4Sample
-                ),
+                ByteBuffer.wrap(sample),
                 info
             )
             videoSamplesWritten++
         }.onFailure { error ->
             failRecordingLocked(
                 "Erro ao gravar vídeo: " +
-                    (
-                        error.message
-                            ?: error.javaClass
-                                .simpleName
-                        )
+                    (error.message ?: error.javaClass.simpleName)
             )
         }
     }
+
+    private fun analyzeVideoPacketLocked(
+        data: ByteArray
+    ) {
+        val nals = splitAnnexBNals(data)
+        var hevcEvidence = false
+        var avcEvidence = false
+
+        for (nal in nals) {
+            if (nal.isEmpty()) continue
+
+            val first = nal[0].toInt() and 0xff
+            val avcType = first and 0x1f
+
+            if (nal.size >= 2) {
+                val hevcType =
+                    (first ushr 1) and 0x3f
+                val temporalIdPlus1 =
+                    nal[1].toInt() and 0x07
+
+                when (hevcType) {
+                    32 -> {
+                        hevcVps = withStartCode(nal)
+                        hevcEvidence = true
+                    }
+
+                    33 -> {
+                        hevcSps = withStartCode(nal)
+                        hevcEvidence = true
+                    }
+
+                    34 -> {
+                        hevcPps = withStartCode(nal)
+                        hevcEvidence = true
+                    }
+
+                    in 16..21 -> {
+                        hevcEvidence = true
+                    }
+                }
+
+                if (
+                    avcType == 2 &&
+                    hevcType == 1 &&
+                    temporalIdPlus1 in 1..7
+                ) {
+                    hevcEvidence = true
+                }
+            }
+
+            when (avcType) {
+                7 -> {
+                    avcSps = withStartCode(nal)
+                    avcEvidence = true
+                }
+
+                8 -> {
+                    avcPps = withStartCode(nal)
+                    avcEvidence = true
+                }
+
+                5 -> {
+                    avcEvidence = true
+                }
+            }
+        }
+
+        if (hevcEvidence) {
+            detectedVideoCodec = VideoCodec.HEVC
+        } else if (
+            detectedVideoCodec == VideoCodec.UNKNOWN &&
+            avcEvidence
+        ) {
+            detectedVideoCodec = VideoCodec.AVC
+        }
+    }
+
+    private fun isSyncAccessUnit(
+        data: ByteArray
+    ): Boolean {
+        val nals = splitAnnexBNals(data)
+
+        for (nal in nals) {
+            if (nal.isEmpty()) continue
+
+            val first = nal[0].toInt() and 0xff
+
+            when (detectedVideoCodec) {
+                VideoCodec.HEVC -> {
+                    if (nal.size < 2) continue
+
+                    val type =
+                        (first ushr 1) and 0x3f
+
+                    if (type in 16..21) {
+                        return true
+                    }
+                }
+
+                VideoCodec.AVC -> {
+                    if ((first and 0x1f) == 5) {
+                        return true
+                    }
+                }
+
+                VideoCodec.UNKNOWN -> {
+                    val avcType = first and 0x1f
+                    val hevcType =
+                        if (nal.size >= 2) {
+                            (first ushr 1) and 0x3f
+                        } else {
+                            -1
+                        }
+
+                    if (
+                        avcType == 5 ||
+                        hevcType in 16..21
+                    ) {
+                        return true
+                    }
+                }
+            }
+        }
+
+        return false
+    }
+
+    private fun tryStartMuxerLocked() {
+        if (
+            !recordingRequested ||
+            muxerReady ||
+            !audioProbeCompleted
+        ) {
+            return
+        }
+
+        val width =
+            frameWidth.takeIf { it > 0 }
+                ?: 1920
+        val height =
+            frameHeight.takeIf { it > 0 }
+                ?: 1080
+
+        val videoFormat =
+            when (detectedVideoCodec) {
+                VideoCodec.HEVC -> {
+                    val vps = hevcVps ?: return
+                    val sps = hevcSps ?: return
+                    val pps = hevcPps ?: return
+
+                    MediaFormat.createVideoFormat(
+                        MediaFormat.MIMETYPE_VIDEO_HEVC,
+                        width,
+                        height
+                    ).apply {
+                        setByteBuffer(
+                            "csd-0",
+                            ByteBuffer.wrap(
+                                concatByteArrays(
+                                    vps,
+                                    sps,
+                                    pps
+                                )
+                            )
+                        )
+                    }
+                }
+
+                VideoCodec.AVC -> {
+                    val sps =
+                        avcSps
+                            ?: streamConfig?.sps
+                            ?: return
+
+                    val pps =
+                        avcPps
+                            ?: streamConfig?.pps
+                            ?: return
+
+                    MediaFormat.createVideoFormat(
+                        MediaFormat.MIMETYPE_VIDEO_AVC,
+                        width,
+                        height
+                    ).apply {
+                        setByteBuffer(
+                            "csd-0",
+                            ByteBuffer.wrap(sps)
+                        )
+                        setByteBuffer(
+                            "csd-1",
+                            ByteBuffer.wrap(pps)
+                        )
+                    }
+                }
+
+                VideoCodec.UNKNOWN -> {
+                    return
+                }
+            }
+
+        val pfd = parcelFileDescriptor ?: return
+
+        val localMuxer = runCatching {
+            MediaMuxer(
+                pfd.fileDescriptor,
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+            )
+        }.getOrElse { error ->
+            failRecordingLocked(
+                "Falha ao abrir MP4: " +
+                    (error.message ?: error.javaClass.simpleName)
+            )
+            return
+        }
+
+        try {
+            videoTrackIndex =
+                localMuxer.addTrack(
+                    videoFormat
+                )
+
+            configureAudioTrackLocked(
+                localMuxer,
+                streamConfig?.audio
+            )
+
+            localMuxer.start()
+            muxer = localMuxer
+            muxerReady = true
+
+            onMain {
+                statusCallback?.invoke(
+                    buildRecordingReadyMessage()
+                )
+            }
+        } catch (error: Exception) {
+            runCatching {
+                localMuxer.release()
+            }
+
+            failRecordingLocked(
+                "Falha ao iniciar MP4: " +
+                    (error.message ?: error.javaClass.simpleName)
+            )
+        }
+    }
+
+    private fun stripParameterSetsForMux(
+        data: ByteArray
+    ): ByteArray {
+        val nals = splitAnnexBNals(data)
+        val out = ByteArrayOutputStream()
+
+        for (nal in nals) {
+            if (nal.isEmpty()) continue
+
+            val first = nal[0].toInt() and 0xff
+
+            val skip =
+                when (detectedVideoCodec) {
+                    VideoCodec.HEVC -> {
+                        if (nal.size < 2) {
+                            false
+                        } else {
+                            val type =
+                                (first ushr 1) and 0x3f
+
+                            type == 32 ||
+                                type == 33 ||
+                                type == 34
+                        }
+                    }
+
+                    VideoCodec.AVC -> {
+                        val type = first and 0x1f
+                        type == 7 || type == 8
+                    }
+
+                    VideoCodec.UNKNOWN -> false
+                }
+
+            if (!skip) {
+                out.write(START_CODE)
+                out.write(nal)
+            }
+        }
+
+        return out.toByteArray()
+    }
+
+    private fun withStartCode(
+        nal: ByteArray
+    ): ByteArray {
+        val result =
+            ByteArray(
+                START_CODE.size +
+                    nal.size
+            )
+
+        START_CODE.copyInto(
+            result,
+            0
+        )
+        nal.copyInto(
+            result,
+            START_CODE.size
+        )
+
+        return result
+    }
+
+    private fun concatByteArrays(
+        vararg arrays: ByteArray
+    ): ByteArray {
+        val result =
+            ByteArray(
+                arrays.sumOf { it.size }
+            )
+
+        var offset = 0
+
+        for (array in arrays) {
+            array.copyInto(
+                result,
+                offset
+            )
+            offset += array.size
+        }
+
+        return result
+    }
+
+    private fun codecLabel(): String =
+        when (detectedVideoCodec) {
+            VideoCodec.HEVC -> "H.265/HEVC"
+            VideoCodec.AVC -> "H.264/AVC"
+            VideoCodec.UNKNOWN -> "detectando codec"
+        }
 
     private fun configureAudioTrackLocked(
         localMuxer: MediaMuxer,
@@ -1387,35 +1607,10 @@ class CameraStreamController {
         }
     }
 
-    private fun isSyncNalOrSlice(
+    private fun legacySyncCheckUnused(
         data: ByteArray
     ): Boolean {
-        val nals =
-            splitAnnexBNals(
-                data
-            )
-
-        for (nal in nals) {
-            if (nal.isEmpty()) continue
-
-            val type =
-                nal[0].toInt() and 0x1f
-
-            if (type == 5) {
-                return true
-            }
-
-            if (
-                type == 1 &&
-                isIntraSlice(
-                    nal
-                )
-            ) {
-                return true
-            }
-        }
-
-        return false
+        return isSyncAccessUnit(data)
     }
 
     private fun splitAnnexBNals(
@@ -1645,28 +1840,23 @@ class CameraStreamController {
         val audioText =
             when (audioMode) {
                 RecordingAudioMode.NONE ->
-                    "sem faixa de áudio gravável"
+                    "sem áudio gravável"
 
-                RecordingAudioMode
-                    .AAC_DIRECT ->
+                RecordingAudioMode.AAC_DIRECT ->
                     "áudio AAC"
 
-                RecordingAudioMode
-                    .G711_ULAW_TO_AAC ->
+                RecordingAudioMode.G711_ULAW_TO_AAC ->
                     "áudio G.711 μ-law → AAC"
 
-                RecordingAudioMode
-                    .G711_ALAW_TO_AAC ->
+                RecordingAudioMode.G711_ALAW_TO_AAC ->
                     "áudio G.711 A-law → AAC"
             }
 
-        return if (
-            videoSamplesWritten > 0
-        ) {
-            "● REC gravando • $audioText"
-        } else {
-            "REC ativo • modo compatibilidade Yoosee • $audioText"
-        }
+        return "REC pronto • " +
+            codecLabel() +
+            " • " +
+            audioText +
+            " • aguardando quadro-chave"
     }
 
     private fun failRecording(
@@ -1797,6 +1987,8 @@ class CameraStreamController {
         recordingContext = null
         statusCallback = null
         streamConfig = null
+        audioProbeCompleted = false
+        videoStarted = false
 
         videoStartArrivalUs =
             Long.MIN_VALUE
@@ -2120,6 +2312,9 @@ class CameraStreamController {
 
         private const val PRE_ROLL_US =
             8_000_000L
+
+        private val START_CODE =
+            byteArrayOf(0, 0, 0, 1)
 
         private const val AAC_SAMPLES_PER_FRAME =
             1024L
