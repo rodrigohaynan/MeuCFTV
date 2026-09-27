@@ -40,7 +40,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")
 
-    implementation("com.github.alexeyvasilyev:rtsp-client-android:5.6.5")
+    implementation("com.github.alexeyvasilyev:rtsp-client-android:5.5.0")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
