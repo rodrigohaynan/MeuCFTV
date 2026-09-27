@@ -123,7 +123,10 @@ class CameraStreamController {
             lastPtsUs = -1L
             writtenSamples = 0
             muxerReady = false
-            waitingForKeyFrame = true
+            waitingForKeyFrame = false
+            videoFramesSeen = 0
+            keyFramesSeen = 0
+            lastRecordedTimestampMs = Long.MIN_VALUE
             statusCallback = onStatus
 
             onMain {
@@ -225,8 +228,7 @@ class CameraStreamController {
                             "● REC gravando • quadro-chave em cache • " +
                                 (recordingDisplayName ?: "MeuCFTV.mp4")
                         } else {
-                            "REC ativo • aguardando quadro-chave H.264 • " +
-                                "frames vistos: $videoFramesSeen"
+                            "REC ativo • gravando a partir do próximo quadro recebido"
                         }
                     )
                 }
@@ -265,8 +267,8 @@ class CameraStreamController {
                 "Vídeo salvo: Armazenamento interno > Movies > MeuCFTV > " +
                     (recordingDisplayName ?: "MeuCFTV.mp4")
             } else {
-                "Nenhum quadro H.264 foi gravado; frames vistos: $videoFramesSeen, " +
-                    "quadros-chave: $keyFramesSeen; arquivo incompleto removido"
+                "Nenhum quadro foi gravado; frames recebidos durante REC: " +
+                    "$videoFramesSeen; arquivo incompleto removido"
             }
 
             resetRecordingState()
@@ -388,33 +390,45 @@ class CameraStreamController {
             }
 
             if (writtenSamples == 0) {
-                if (gopBuffer.isEmpty()) {
-                    onMain {
-                        statusCallback?.invoke(
-                            "REC pronto • aguardando primeiro quadro-chave H.264"
+                val firstBuffered = gopBuffer.firstOrNull()
+
+                if (firstBuffered?.keyFrame == true) {
+                    firstTimestampMs = firstBuffered.timestampMs
+
+                    for (frame in gopBuffer) {
+                        writeVideoFrameLocked(
+                            frame.data,
+                            frame.timestampMs,
+                            frame.keyFrame
                         )
                     }
+
+                    onMain {
+                        statusCallback?.invoke(
+                            "● REC gravando • iniciado em quadro-chave • " +
+                                (recordingDisplayName ?: "MeuCFTV.mp4")
+                        )
+                    }
+
                     return
                 }
 
-                val first = gopBuffer.firstOrNull()
-                if (first?.keyFrame != true) {
-                    return
-                }
+                // Some Yoosee firmware streams decode correctly but never expose
+                // NAL type 5 (IDR) to the RTSP listener. Waiting forever for IDR
+                // therefore prevents any recording. Start from the first received
+                // access unit and mark only that first sample as sync so the MP4
+                // is finalized instead of being discarded.
+                firstTimestampMs = timestampMs
 
-                firstTimestampMs = first.timestampMs
-
-                for (frame in gopBuffer) {
-                    writeVideoFrameLocked(
-                        frame.data,
-                        frame.timestampMs,
-                        frame.keyFrame
-                    )
-                }
+                writeVideoFrameLocked(
+                    copied,
+                    timestampMs,
+                    keyFrame = true
+                )
 
                 onMain {
                     statusCallback?.invoke(
-                        "● REC gravando • quadro-chave obtido • " +
+                        "● REC gravando • início compatível Yoosee • " +
                             (recordingDisplayName ?: "MeuCFTV.mp4")
                     )
                 }
