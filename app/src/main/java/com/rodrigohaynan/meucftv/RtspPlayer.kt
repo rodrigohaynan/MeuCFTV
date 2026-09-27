@@ -3,61 +3,86 @@ package com.rodrigohaynan.meucftv
 import android.net.Uri
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.media3.common.MediaItem
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.rtsp.RtspMediaSource
-import androidx.media3.ui.PlayerView
+import org.videolan.libvlc.LibVLC
+import org.videolan.libvlc.Media
+import org.videolan.libvlc.MediaPlayer
+import org.videolan.libvlc.util.VLCVideoLayout
 
 @Composable
 fun RtspPlayer(
     config: CameraConfig,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
-
-    val player = remember(
+    key(
         config.host,
         config.rtspPort,
         config.rtspPath,
         config.rtspUser,
         config.password
     ) {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaItem = MediaItem.fromUri(buildRtspUri(config))
-            val mediaSource = RtspMediaSource.Factory()
-                .setForceUseRtpTcp(true)
-                .createMediaSource(mediaItem)
+        val context = LocalContext.current
 
-            setMediaSource(mediaSource)
-            prepare()
-            playWhenReady = true
+        val libVlc = remember {
+            LibVLC(
+                context.applicationContext,
+                arrayListOf(
+                    "--rtsp-tcp",
+                    "--network-caching=700",
+                    "--clock-jitter=0",
+                    "--clock-synchro=0"
+                )
+            )
         }
-    }
 
-    DisposableEffect(player) {
-        onDispose { player.release() }
-    }
+        val mediaPlayer = remember(libVlc) {
+            MediaPlayer(libVlc)
+        }
 
-    AndroidView(
-        modifier = modifier,
-        factory = { viewContext ->
-            PlayerView(viewContext).apply {
-                useController = true
-                this.player = player
+        DisposableEffect(mediaPlayer, libVlc) {
+            onDispose {
+                runCatching { mediaPlayer.stop() }
+                runCatching { mediaPlayer.detachViews() }
+                mediaPlayer.release()
+                libVlc.release()
             }
-        },
-        update = { it.player = player }
-    )
+        }
+
+        AndroidView(
+            modifier = modifier,
+            factory = { viewContext ->
+                VLCVideoLayout(viewContext).also { videoLayout ->
+                    mediaPlayer.attachViews(
+                        videoLayout,
+                        null,
+                        false,
+                        false
+                    )
+
+                    val media = Media(libVlc, buildRtspUri(config)).apply {
+                        setHWDecoderEnabled(true, false)
+                        addOption(":rtsp-tcp")
+                        addOption(":network-caching=700")
+                    }
+
+                    mediaPlayer.media = media
+                    media.release()
+                    mediaPlayer.play()
+                }
+            }
+        )
+    }
 }
 
 private fun buildRtspUri(config: CameraConfig): Uri {
     val user = Uri.encode(config.rtspUser)
     val password = Uri.encode(config.password)
     val credentials = if (user.isNotBlank()) "$user:$password@" else ""
+
     val path = if (config.rtspPath.startsWith("/")) {
         config.rtspPath
     } else {
