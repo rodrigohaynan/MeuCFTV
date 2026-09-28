@@ -284,7 +284,7 @@ class HubService : Service() {
             )
             .setSmallIcon(
                 android.R.drawable
-                    .presense_video_online
+                    .presence_video_online
             )
             .setContentTitle(
                 "MeuCFTV Hub"
