@@ -90,11 +90,21 @@ class OnvifClient(
             """.trimIndent()
         )
 
-        val mediaUrl = extractServiceXAddr(capabilitiesXml, "Media")
-            ?: "http://${config.host}:${config.onvifPort}/onvif/media_service"
+        val mediaUrl = normalizeServiceUrl(
+            extractServiceXAddr(
+                capabilitiesXml,
+                "Media"
+            ),
+            "/onvif/media_service"
+        )
 
-        val ptzUrl = extractServiceXAddr(capabilitiesXml, "PTZ")
-            ?: "http://${config.host}:${config.onvifPort}/onvif/ptz_service"
+        val ptzUrl = normalizeServiceUrl(
+            extractServiceXAddr(
+                capabilitiesXml,
+                "PTZ"
+            ),
+            "/onvif/ptz_service"
+        )
 
         val profilesXml = postSoap(
             url = mediaUrl,
@@ -239,6 +249,22 @@ class OnvifClient(
             setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
         )
         return regex.find(xml)?.groupValues?.getOrNull(1)
+    }
+
+    private fun normalizeServiceUrl(
+        advertisedUrl: String?,
+        fallbackPath: String
+    ): String {
+        val path = runCatching {
+            advertisedUrl
+                ?.let { URL(it).path }
+                ?.takeIf {
+                    it.isNotBlank()
+                }
+        }.getOrNull()
+            ?: fallbackPath
+
+        return "http://${config.host}:${config.onvifPort}$path"
     }
 
     private fun xmlEscape(value: String): String =

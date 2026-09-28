@@ -1,6 +1,7 @@
 package com.rodrigohaynan.meucftv
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Bundle
@@ -69,6 +70,7 @@ class MainActivity : ComponentActivity() {
 private fun MeuCftvApp() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val store = remember { SecureCameraStore(context) }
+    val hubPreferences = remember { HubPreferences(context) }
     val streamController = remember { CameraStreamController() }
     val audioManager = remember {
         context.getSystemService(AudioManager::class.java)
@@ -81,6 +83,16 @@ private fun MeuCftvApp() {
     var audioDetected by remember { mutableStateOf(false) }
     var recording by remember { mutableStateOf(false) }
     var talking by remember { mutableStateOf(false) }
+    var hubEnabled by remember {
+        mutableStateOf(
+            hubPreferences.isEnabled()
+        )
+    }
+    var hubAddresses by remember {
+        mutableStateOf(
+            HubNetworkInfo.addresses()
+        )
+    }
     var muted by remember {
         mutableStateOf(audioManager.isStreamMute(AudioManager.STREAM_MUSIC))
     }
@@ -142,6 +154,54 @@ private fun MeuCftvApp() {
             talking = false
             status = "Microfone desligado"
         }
+    }
+
+    fun startHub() {
+        if (!config.isConfigured) {
+            status =
+                "Configure primeiro a câmera local deste celular Hub"
+            return
+        }
+
+        runCatching {
+            context.startForegroundService(
+                Intent(
+                    context,
+                    HubService::class.java
+                ).setAction(
+                    HubService.ACTION_START
+                )
+            )
+
+            hubPreferences.setEnabled(true)
+            hubEnabled = true
+            hubAddresses =
+                HubNetworkInfo.addresses()
+
+            status =
+                "MeuCFTV Hub iniciado • RTSP 8554 • ONVIF 8500"
+        }.onFailure {
+            status =
+                "Falha ao iniciar Hub: " +
+                    (it.message ?: "erro desconhecido")
+        }
+    }
+
+    fun stopHub() {
+        runCatching {
+            context.startService(
+                Intent(
+                    context,
+                    HubService::class.java
+                ).setAction(
+                    HubService.ACTION_STOP
+                )
+            )
+        }
+
+        hubPreferences.setEnabled(false)
+        hubEnabled = false
+        status = "MeuCFTV Hub desligado"
     }
 
     val microphonePermissionLauncher = rememberLauncherForActivityResult(
@@ -208,6 +268,33 @@ private fun MeuCftvApp() {
             }
 
             if (config.isConfigured) {
+                HubCard(
+                    enabled = hubEnabled,
+                    addresses = hubAddresses,
+                    onToggle = {
+                        if (hubEnabled) {
+                            stopHub()
+                        } else {
+                            startHub()
+                        }
+                    },
+                    onRefresh = {
+                        hubAddresses =
+                            HubNetworkInfo.addresses()
+
+                        status =
+                            if (
+                                hubAddresses.any {
+                                    it.isTailscale
+                                }
+                            ) {
+                                "Endereço remoto do Hub atualizado"
+                            } else {
+                                "Hub local encontrado • Tailscale ainda não detectado"
+                            }
+                    }
+                )
+
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Box(
                         modifier = Modifier
@@ -377,6 +464,140 @@ private fun MeuCftvApp() {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun HubCard(
+    enabled: Boolean,
+    addresses: List<HubAddress>,
+    onToggle: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement =
+                Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                "MeuCFTV Hub",
+                style =
+                    MaterialTheme.typography
+                        .titleMedium
+            )
+
+            Text(
+                if (enabled) {
+                    "● Hub ativo em segundo plano"
+                } else {
+                    "Hub desligado"
+                },
+                style =
+                    MaterialTheme.typography
+                        .bodyMedium
+            )
+
+            Text(
+                "Este celular funciona como gateway da câmera. " +
+                    "Deixe-o em casa, no mesmo Wi-Fi da câmera e conectado ao carregador.",
+                style =
+                    MaterialTheme.typography
+                        .bodySmall
+            )
+
+            Row(
+                horizontalArrangement =
+                    Arrangement.spacedBy(
+                        10.dp
+                    )
+            ) {
+                Button(
+                    onClick = onToggle
+                ) {
+                    Text(
+                        if (enabled) {
+                            "Parar Hub"
+                        } else {
+                            "Iniciar Hub"
+                        }
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onRefresh
+                ) {
+                    Text("Atualizar IPs")
+                }
+            }
+
+            if (addresses.isEmpty()) {
+                Text(
+                    "Nenhum endereço IPv4 disponível.",
+                    style =
+                        MaterialTheme.typography
+                            .bodySmall
+                )
+            } else {
+                addresses.forEach {
+                    address ->
+
+                    Text(
+                        (
+                            if (
+                                address.isTailscale
+                            ) {
+                                "Tailscale"
+                            } else {
+                                address.interfaceName
+                            }
+                            ) +
+                            ": " +
+                            address.address,
+                        style =
+                            MaterialTheme.typography
+                                .bodySmall
+                    )
+                }
+            }
+
+            val remote =
+                addresses.firstOrNull {
+                    it.isTailscale
+                }
+
+            if (remote != null) {
+                Text(
+                    "No celular remoto: Host " +
+                        remote.address +
+                        " • RTSP " +
+                        HubService.RTSP_PROXY_PORT +
+                        " • ONVIF " +
+                        HubService.ONVIF_PROXY_PORT +
+                        ". Mantenha caminho e credenciais da câmera.",
+                    style =
+                        MaterialTheme.typography
+                            .bodySmall
+                )
+            } else {
+                Text(
+                    "Para acesso fora de casa, conecte este celular e o celular principal " +
+                        "à mesma rede Tailscale. O Hub detectará o endereço 100.x automaticamente.",
+                    style =
+                        MaterialTheme.typography
+                            .bodySmall
+                )
+            }
+
+            Text(
+                "O Hub inicia novamente após reiniciar o aparelho enquanto estiver habilitado.",
+                style =
+                    MaterialTheme.typography
+                        .bodySmall
+            )
         }
     }
 }
